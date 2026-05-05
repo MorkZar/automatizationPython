@@ -102,11 +102,19 @@ def create_daily_monitoring_copies() -> tuple[str, str]:
 
     ksi_src = Path(KSI_FILE)
     ksi_copy = ksi_src.with_name(f"Daily System Closing status_{today}{ksi_src.suffix}")
-    shutil.copy2(ksi_src, ksi_copy)
+    if not ksi_copy.exists():
+        shutil.copy2(ksi_src, ksi_copy)
+        log.info(f"Created daily KSI copy: {ksi_copy}")
+    else:
+        log.info(f"Using existing daily KSI copy: {ksi_copy}")
 
     mcm_src = Path(MCM_QC_FILE)
     mcm_copy = mcm_src.with_name(f"MCM QC Inv Monitoring_{today}{mcm_src.suffix}")
-    shutil.copy2(mcm_src, mcm_copy)
+    if not mcm_copy.exists():  # ← Y aquí también
+        shutil.copy2(mcm_src, mcm_copy)
+        log.info(f"Created daily MCM QC copy: {mcm_copy}")
+    else:
+        log.info(f"Using existing daily MCM QC copy: {mcm_copy}")
 
     log.info(f"Created daily KSI copy: {ksi_copy}")
     log.info(f"Created daily MCM QC copy: {mcm_copy}")
@@ -119,6 +127,29 @@ def get_download_path():
     path.mkdir(parents=True, exist_ok=True)
     return path
 
+def get_date_range():
+    """
+    Si hoy es la primera semana del mes (días 1-7):
+        → rango: hace 7 días hasta ayer
+    Si no es la primera semana:
+        → rango: primer día del mes hasta ayer
+    
+    Returns:
+        tuple: (start_date, end_date) en formato "YYYY.MM.DD"
+    """
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    
+    is_first_week = today.day <= 7
+    
+    if is_first_week:
+        start_date = today - timedelta(days=7)
+    else:
+        start_date = today.replace(day=1)
+    
+    return start_date.strftime("%Y.%m.%d"), yesterday.strftime("%Y.%m.%d")
+
+start, end = get_date_range()
 
 def get_latest_file(directory, pattern="*"):
     """Busca el archivo más reciente en una carpeta con un patrón específico.
@@ -152,8 +183,8 @@ def managed_driver(download_path: Path):
     opts.add_argument("--start-maximized")
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-infobars")
-    #opts.add_argument("--headless=new")
-    #opts.add_argument("--disable-gpu")
+    opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
     opts.add_experimental_option("prefs", {
         "download.default_directory": str(download_path),
         "download.prompt_for_download": False,
@@ -594,13 +625,18 @@ def run_wip_rm_defect_case(driver, wait, wb, download_path, log):
     driver.switch_to.default_content()
     wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "mainTabControl_contents_56_body")))
     wait_frame = WebDriverWait(driver, 10)
+    
+    start_date = wait.until(EC.presence_of_element_located((By.ID, "txtSearchPeriodBeginDate_input")))
+    start_date.clear()
+    start_date.send_keys(start)
+    start_date.send_keys(Keys.RETURN)
+    log.info(f"Date set to: {start}")
 
     input_date = wait_frame.until(EC.presence_of_element_located((By.ID, "txtSearchPeriodEndDate_input")))
     input_date.clear()
-    yesterday_date = calculate_yesterday_date()
-    input_date.send_keys(yesterday_date)
+    input_date.send_keys(end)
     input_date.send_keys(Keys.RETURN)
-    log.info(f"Date set to: {yesterday_date}")
+    log.info(f"Date set to: {end}")
 
     log.info("Excecuting main search...")
     inquiry(driver)
@@ -648,13 +684,18 @@ def run_def_remain_case(driver, wait, wb, download_path, log):
     log.info("Switch iframe...")
     driver.switch_to.frame("mainTabControl_contents_3129_body")
     wait_frame = WebDriverWait(driver, 10)
+    
+    start_date = wait.until(EC.presence_of_element_located((By.ID, "txtSearchPeriodBeginDate_input")))
+    start_date.clear()
+    start_date.send_keys(start)
+    start_date.send_keys(Keys.RETURN)
+    log.info(f"Date set to: {start}")
 
     input_date = wait.until(EC.presence_of_element_located((By.ID, "txtSearchPeriodEndDate_input")))
     input_date.clear()
-    yesterday_date = calculate_yesterday_date()
-    input_date.send_keys(yesterday_date)
+    input_date.send_keys(end)
     input_date.send_keys(Keys.RETURN)
-    log.info(f"Date set to: {yesterday_date}")
+    log.info(f"Date set to: {end}")
     time.sleep(2)
 
     unconfirmed_button = wait_frame.until(EC.element_to_be_clickable((By.ID, "chbIS_button")))
@@ -679,7 +720,7 @@ def run_def_remain_case(driver, wait, wb, download_path, log):
         "Failure Confirm action Mgmt.",
         "Def. Remain",
         3,
-        3,
+        5,
         3,
         cols_to_delete=[2, 3, 12, 13],
     )
@@ -745,3 +786,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+   
