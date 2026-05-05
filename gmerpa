@@ -1,0 +1,747 @@
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from dotenv import load_dotenv
+from selenium.webdriver.common.keys import Keys
+import os
+import shutil
+import time
+import logging
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from openpyxl import load_workbook
+from contextlib import contextmanager
+import win32com
+import win32com.client
+load_dotenv()
+
+# =========================
+# LOGS Config
+# =========================
+def get_logs_paths():
+    today = datetime.now().strftime("%y-%m-%d-logs")
+    folder_name = f"logs_{today}"
+    pathlogs = Path(BASE_LOG_DIR) / folder_name
+    pathlogs.mkdir(parents=True, exist_ok=True)
+    return pathlogs
+
+def setup_logger():
+    log_dir = get_logs_paths()
+    log_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"GMES_KPIMonitoring_{timestamp}.log"
+    logger = logging.getLogger("GMES_KPIMonitoring")
+    logger.setLevel(logging.DEBUG)
+    # Formato
+    fmt = logging.Formatter(
+        "[%(asctime)s] [%(levelname)-8s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+     # Handler → archivo
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    # Handler → consola
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    logger.info(f"Log started: {log_file}")
+    return logger
+
+def delete_all_excels(path: str) -> None:
+    """
+    Elimina todos los archivos Excel (.xls, .xlsx) dentro de la carpeta especificada.
+    """
+    log.info("Cleaning up all Excel files in folder...")
+
+    try:
+        for file in os.listdir(path):
+            if file.endswith((".xls", ".xlsx")):
+                file_path = os.path.join(path, file)
+                try:
+                    os.remove(file_path)
+                    log.info(f"Deleted file: {file_path}")
+                except Exception as e:
+                    log.error(f"Error deleting file {file_path}: {e}")
+        log.info("Excel cleanup completed.")
+    except Exception as e:
+        log.error(f"Error accessing folder {path}: {e}")
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+load_dotenv()
+URL      = os.getenv("URL_GMES")
+USUARIO  = os.getenv("GMES_USER")
+PASSWORD = os.getenv("GMES_PASS")
+BASE_DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR")
+BASE_LOG_DIR = os.getenv("DOWNLOAD_LOG_DIR")
+KSI_FILE = os.getenv("KSI_MONITORING_FILE")
+MCM_QC_FILE = os.getenv("MCM_QC_INV_MONITORING_FILE")
+KSI_WORKING_FILE = None
+MCM_QC_WORKING_FILE = None
+log = setup_logger()
+
+
+def create_daily_monitoring_copies() -> tuple[str, str]:
+    """Create daily working copies for KSI and MCM monitoring files."""
+    if not KSI_FILE or not Path(KSI_FILE).exists():
+        raise ValueError(f"KSI_MONITORING_FILE no valido: {KSI_FILE}")
+    if not MCM_QC_FILE or not Path(MCM_QC_FILE).exists():
+        raise ValueError(f"MCM_QC_INV_MONITORING_FILE no valido: {MCM_QC_FILE}")
+
+    today = datetime.now().strftime("%Y%m%d")
+
+    ksi_src = Path(KSI_FILE)
+    ksi_copy = ksi_src.with_name(f"Daily System Closing status_{today}{ksi_src.suffix}")
+    shutil.copy2(ksi_src, ksi_copy)
+
+    mcm_src = Path(MCM_QC_FILE)
+    mcm_copy = mcm_src.with_name(f"MCM QC Inv Monitoring_{today}{mcm_src.suffix}")
+    shutil.copy2(mcm_src, mcm_copy)
+
+    log.info(f"Created daily KSI copy: {ksi_copy}")
+    log.info(f"Created daily MCM QC copy: {mcm_copy}")
+    return str(ksi_copy), str(mcm_copy)
+
+def get_download_path():
+    """Devuelve BASE_DIR/YYYY-MM-DD y crea la carpeta si no existe."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    path = Path(BASE_DOWNLOAD_DIR) / today
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_latest_file(directory, pattern="*"):
+    """Busca el archivo más reciente en una carpeta con un patrón específico.
+    
+    Args:
+        directory: Ruta de la carpeta donde buscar
+        pattern: Patrón de nombre de archivo (ej: "Item Qty_*")
+    
+    Returns:
+        Path del archivo más reciente o None si no encuentra
+    """
+    directory = Path(directory)
+    files = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+download_path = get_download_path()
+log.info(f"Download folder: {download_path}")
+
+def open_main_excel(ksi_file):
+    try:
+        wb = load_workbook(ksi_file)
+        log.info("Main Excel file opened successfully")
+        return wb, ksi_file
+    except Exception as e:
+        log.error(f"Error opening Main Excel file: {e}")
+        sys.exit(1)
+
+@contextmanager
+def managed_driver(download_path: Path):
+    opts = Options()
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-notifications")
+    opts.add_argument("--disable-infobars")
+    #opts.add_argument("--headless=new")
+    #opts.add_argument("--disable-gpu")
+    opts.add_experimental_option("prefs", {
+        "download.default_directory": str(download_path),
+        "download.prompt_for_download": False,
+        "directory_upgrade": True,
+    })
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=opts
+    )
+    try:
+        yield driver
+    finally:
+        driver.quit()
+        
+def validate_env(log):
+    errors = []
+    if not USUARIO or not PASSWORD:
+        errors.append("GMES_USER / GMES_PASS no encontrados en .env")
+    if not URL:
+        errors.append("URL_GMES no encontrada en .env")
+    if not KSI_FILE or not Path(KSI_FILE).exists():
+        errors.append(f"KSI_MONITORING_FILE no válido: {KSI_FILE}")
+    if errors:
+        for e in errors:
+            log.error(e)
+        sys.exit(1)
+        
+def inquiry(driver, max_retries=3, results_wait_timeout=660, post_wait_seconds=1):
+    for attempt in range(1, max_retries + 1):
+        try:
+            log.info(f"Starting Excel Download (attempt {attempt})...")
+            # ── 6. Ejecutar búsqueda ──────────────────────────────────────────────
+            wait_frame = WebDriverWait(driver, 20)
+            log.info("Excecuting main search...")
+            wait_frame.until(EC.element_to_be_clickable((By.ID, "btnMainSearch"))).click()
+            log.info("Búsqueda iniciada")
+
+            # ── 7. Esperar resultados ─────────────────────────────────────────────
+            log.info("Waiting for loading bar...")
+            WebDriverWait(driver, results_wait_timeout).until(
+            EC.invisibility_of_element_located((By.ID, "lbMsg"))
+            )
+            log.info("Results loaded")
+
+            try:
+               WebDriverWait(driver, 3).until(EC.alert_is_present())
+               alert = driver.switch_to.alert
+               log.warning(f"Alert detected: {alert.text}")
+               alert.accept()
+            except TimeoutException:
+                log.warning("No alert detected")
+
+            # Espera extra para que el archivo termine de escribirse
+            time.sleep(post_wait_seconds)
+
+            log.info("✅ Excel Charged successfully")
+            return True  # salida exitosa
+
+        except (TimeoutException, WebDriverException) as e:
+            log.error(f"⚠️ Download failed on attempt {attempt}: {e}")
+
+            if attempt < max_retries:
+                log.info("Retrying after waiting 15 seconds...")
+                time.sleep(15)
+            else:
+                log.critical("❌ Max retries reached. Download failed.")
+                raise
+
+
+def download_excel(
+    driver,
+    max_retries=3,
+    btn_id=None,
+    file_name=None,
+    progress_wait_timeout=180,
+    post_wait_seconds=5,
+):
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            log.info(f"Starting Excel Download (attempt {attempt})...")
+
+            # Espera botón clickeable
+            download_btn = WebDriverWait(driver, 20).until(
+                EC.element_to_be_clickable((By.ID, btn_id))
+            )
+
+            download_btn.click()
+            log.debug("Excel download button clicked")
+
+            time.sleep(1)
+
+            # Confirmación (ENTER)
+            driver.switch_to.active_element.send_keys(Keys.ENTER)
+            log.info("Download confirmation sent (ENTER)")
+
+            # Manejo de alertas (si aparecen)
+            try:
+                WebDriverWait(driver, 5).until(EC.alert_is_present())
+                alert = driver.switch_to.alert
+                log.warning(f"Alert detected: {alert.text}")
+                alert.accept()
+            except TimeoutException:
+                log.info("No alert detected")
+
+            # Espera a que desaparezca el mensaje de progreso
+            WebDriverWait(driver, progress_wait_timeout).until(
+                EC.invisibility_of_element_located((By.ID, "lbMsg"))
+            )
+
+            # Espera extra para que el archivo termine de escribirse
+            time.sleep(post_wait_seconds)
+
+            downloaded_file = None
+            if file_name:
+                downloaded_file = wait_excel(file_name)
+                log.info(f"Excel file ready: {downloaded_file.name}")
+
+            log.info("✅ Excel downloaded successfully")
+            return downloaded_file if downloaded_file else True  # salida exitosa
+
+        except (TimeoutException, WebDriverException) as e:
+            log.error(f"⚠️ Download failed on attempt {attempt}: {e}")
+
+            if attempt < max_retries:
+                log.info("Retrying after waiting 10 seconds...")
+                time.sleep(10)
+            else:
+                log.critical("❌ Max retries reached. Download failed.")
+                raise 
+
+        
+def wait_excel(file_name):
+    """Espera a que el archivo Excel esté completamente guardado y no esté bloqueado."""
+    while True:
+        latest_file = get_latest_file(get_download_path(), f"{file_name}*.xlsx")
+        if latest_file and not latest_file.stat().st_size == 0:
+            try:
+                # Intentar abrir el archivo para verificar que no esté bloqueado
+                with open(latest_file, "rb"):
+                    return latest_file
+            except IOError:
+                time.sleep(1)  # Esperar un segundo antes de intentar de nuevo
+        else:
+            time.sleep(1)  # Esperar un segundo antes de verificar nuevamente
+
+
+def find_element_in_default_or_iframes(driver, by, value, timeout=20):
+    """Busca un elemento en default_content y en iframes del mismo documento."""
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        driver.switch_to.default_content()
+
+        # Intento en documento principal
+        elements = driver.find_elements(by, value)
+        if elements:
+            return elements[0], "default_content"
+
+        # Intento en cada iframe
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+        for idx, _ in enumerate(frames):
+            try:
+                driver.switch_to.default_content()
+                current_frames = driver.find_elements(By.TAG_NAME, "iframe")
+                if idx >= len(current_frames):
+                    continue
+                driver.switch_to.frame(current_frames[idx])
+                elements = driver.find_elements(by, value)
+                if elements:
+                    return elements[0], f"iframe[{idx}]"
+            except Exception:
+                continue
+
+        time.sleep(0.5)
+
+    raise TimeoutException(f"Element not found in default/iframes: {by}={value}")
+
+def calculate_yesterday_date():
+    yesterday = datetime.now() - timedelta(days=1)
+    return yesterday.strftime("%Y%m%d")           
+
+
+def is_http_read_timeout_error(error):
+    message = str(error)
+    return "HTTPConnectionPool" in message and "Read timed out" in message
+            
+def process_excel(wb,download_path, log, nombre_archivo, sheet_name, start_row, start_col, delete_row, cols_to_delete=None):
+    log.info("Processing Excel file...")
+    latest_excel = get_latest_file(download_path, f"{nombre_archivo}*.xlsx")
+    if latest_excel:
+        log.info(f"Opening latest file: {latest_excel.name}")
+    wb_src = load_workbook(latest_excel)
+    ws_src = wb_src.active
+    
+    log.info("Cleaning extra rows...")
+    # Limpiar filas sobrantes
+    ws_src.delete_rows(1, delete_row)
+    ws_src.delete_rows(ws_src.max_row, 1)
+
+    if cols_to_delete:
+        log.info(f"Deleting source columns: {cols_to_delete}")
+        for col_idx in sorted(cols_to_delete, reverse=True):
+            ws_src.delete_cols(col_idx, 1)
+
+    log.info("Opening KSI...")
+    wb_dst = wb
+    ws_dst = wb_dst[sheet_name]
+
+    # Escritura directa sin lista intermedia en RAM
+    for r_idx, row in enumerate(ws_src.iter_rows(values_only=True), start=start_row):
+        for c_idx, value in enumerate(row, start=start_col):
+            ws_dst.cell(row=r_idx, column=c_idx, value=value)
+
+    wb_src.close()         # cerrar origen antes de guardar destino
+    log.info("✅ Datos copiados y guardados")
+
+def processPV3():
+    file = MCM_QC_WORKING_FILE
+    if not file:
+        log.error("MCM QC working file not initialized")
+        return
+
+    excel = None
+    wb = None
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.ScreenUpdating = False
+        excel.userControl = False
+        excel.WindowState = -4137  # xlMaximized
+        wb = excel.Workbooks.Open(file)
+        ws = wb.Sheets("PV3 (QC)")
+
+        ws.Activate()
+        pivot = ws.PivotTables(1)
+
+        pivot.ChangePivotCache(
+            wb.PivotCaches().Create(
+                SourceType=1,
+                SourceData="'Inv.All_Loc'!$B$2:$AG$18793"
+            )
+        )
+        pivot.RefreshTable()
+        excel.Calculation = -4105        # xlCalculationAutomatic: restaurar
+        excel.ScreenUpdating = True
+        wb.Save()
+        log.info("Workbook saved after PV3 processing")
+    finally:
+        if wb is not None:
+            wb.Close(SaveChanges=True)
+        if excel is not None:
+            excel.Quit()
+
+def run_login_case(driver, wait, log):
+    log.info("login...")
+    wait.until(EC.presence_of_element_located((By.ID, "txtUSER_ID"))).send_keys(USUARIO)
+    driver.find_element(By.ID, "txtPWD").send_keys(PASSWORD)
+    driver.find_element(By.ID, "cboLocale_button").click()
+    wait.until(EC.element_to_be_clickable((By.ID, "cboLocale_itemTable_1"))).click()
+    time.sleep(1)
+    driver.find_element(By.ID, "btnLogin").click()
+    log.info("Successfully logged in")
+    wait.until(EC.presence_of_element_located((By.ID, "btn_nav02")))
+    log.info("Login succesful - main page loaded")
+
+
+def run_itrmqty_case(driver, wait, wb, download_path, log):
+    log.info("Starting Item Qty Process......")
+    for elem_id in ["btn_nav02", "ui-id-11", "ui-id-19"]:
+        el = wait.until(EC.element_to_be_clickable((By.ID, elem_id)))
+        driver.execute_script("arguments[0].scrollIntoView(true);", el)
+        el.click()
+
+    log.info("Switch iframe...")
+    driver.switch_to.default_content()
+    driver.switch_to.frame("mainTabControl_contents_1406_body")
+    wait_frame = WebDriverWait(driver, 10)
+
+    log.info("Selecting Refrence Time option...")
+    rt = wait_frame.until(EC.element_to_be_clickable((By.ID, "rdoArragement_input_1")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", rt)
+    rt.click()
+    log.info("Reference Time selected")
+
+    log.info("Selecting Current Date and hour 6:51...")
+    hour = wait_frame.until(EC.element_to_be_clickable((By.ID, "cboDateRevList_button")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", hour)
+    hour.click()
+    hour_option = wait_frame.until(EC.element_to_be_clickable((By.ID, "cboDateRevList_itemTable_1")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", hour_option)
+    hour_option.click()
+    log.debug("Hour 6:51 selected")
+
+    log.info("Selecting ERP Qty option...")
+    erpqty = wait_frame.until(EC.element_to_be_clickable((By.ID, "chkRFC_input_0")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", erpqty)
+    erpqty.click()
+    log.info("ERP Qty selected")
+
+    inquiry(driver)
+    download_excel(driver, btn_id="btnGrid1ExcelDownload", file_name="Item Qty")
+    log.info("Excel download process completed")
+    time.sleep(1)
+    log.info("Processing Excel file and copying to KSI...")
+    process_excel(wb, download_path, log, "Item Qty", "SAP&SCL ", 2, 1, 2)
+    log.info("Item Qty processing completed")
+    return wait_frame
+
+
+def run_itembar_case(driver, wait_frame, wb, download_path, log):
+    log.info("Starting Item Bar Qty process...")
+    log.info("Selecting Bar Id Item Qty option")
+    bar_id = wait_frame.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a[aria-controls='tabControl1_contents_content4']")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", bar_id)
+    bar_id.click()
+    log.info("Bar Id Item Qty option selected")
+
+    mgfDate = wait_frame.until(EC.element_to_be_clickable((By.ID, "chkPeriod_input_0")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", mgfDate)
+    mgfDate.click()
+    log.info("Mfg Date option diselected")
+
+    max_itembar_attempts = 3
+    retry_wait_seconds = 5
+    itembar_inquiry_wait_timeout = 900
+    itembar_download_wait_timeout = 300
+    #itembar_post_wait_seconds = 20
+    itembar_post_wait_seconds = 20
+
+    for attempt in range(1, max_itembar_attempts + 1):
+        try:
+            inquiry(
+                driver,
+                results_wait_timeout=itembar_inquiry_wait_timeout,
+                post_wait_seconds=itembar_post_wait_seconds,
+            )
+            break
+        except Exception as e:
+            if is_http_read_timeout_error(e) and attempt < max_itembar_attempts:
+                log.warning(
+                    f"Transient timeout in ItemBar inquiry (attempt {attempt}/{max_itembar_attempts}). Retrying in {retry_wait_seconds}s..."
+                )
+                time.sleep(retry_wait_seconds)
+                continue
+            raise
+
+    for attempt in range(1, max_itembar_attempts + 1):
+        try:
+            download_excel(
+                driver,
+                btn_id="btnGrid4ExcelDownload",
+                file_name="Bar ID Item  Qty",
+                progress_wait_timeout=itembar_download_wait_timeout,
+                post_wait_seconds=itembar_post_wait_seconds,
+            )
+            break
+        except Exception as e:
+            if is_http_read_timeout_error(e) and attempt < max_itembar_attempts:
+                log.warning(
+                    f"Transient timeout in ItemBar download (attempt {attempt}/{max_itembar_attempts}). Retrying in {retry_wait_seconds}s..."
+                )
+                time.sleep(retry_wait_seconds)
+                continue
+            raise
+
+    log.info("Excel download process completed")
+    log.info("Processing Excel file and copying to KSI...")
+    process_excel(wb, download_path, log, "Bar ID Item  Qty", "Barcode", 2, 5, 2)
+    log.info("Item Bar Qty processing completed")
+
+
+def run_mcm_monitoring_case(driver, wait_frame, download_path, log):
+    log.info("Starting MCM Monitoring process...")
+    location = wait_frame.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a[aria-controls='tabControl1_contents_content3']")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", location)
+    location.click()
+    log.info("Location Item Qty selected")
+
+    ckPrice = wait_frame.until(EC.element_to_be_clickable((By.ID, "chkPrice_input_0")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", ckPrice)
+    ckPrice.click()
+    log.info("Price option selected")
+
+    log.info("Excecuting main search...")
+    inquiry(driver)
+    log.info("Búsqueda iniciada")
+    download_excel(driver, btn_id="btnGrid3ExcelDownload", file_name="Location Item Qty")
+    log.info("Excel download process completed")
+    log.info("Processing MCM QC INV Monitoring Excel file and copying to KSI...")
+    mcm_qc = MCM_QC_WORKING_FILE
+    if not mcm_qc:
+         raise ValueError("MCM QC working file no inicializado")
+
+    wb2 = load_workbook(mcm_qc)
+    try:
+        process_excel(wb2, download_path, log, "Location Item Qty", "Inv.All_Loc", 3, 2, 2)
+        wb2.save(mcm_qc)
+    finally:
+        wb2.close()
+    time.sleep(1)
+    processPV3()
+    log.info("MCM Monitoring processing completed")
+
+
+def run_wip_rm_defect_case(driver, wait, wb, download_path, log):
+    
+    log.info("Starting WIP defect & RM defect process...")
+    btn_nav, nav_context = find_element_in_default_or_iframes(driver, By.ID, "btn_nav04", timeout=25)
+    log.info(f"btn_nav04 found in: {nav_context}")
+    driver.execute_script("arguments[0].scrollIntoView(true);", btn_nav)
+    try:
+        btn_nav.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", btn_nav)
+    log.debug("btn_nav04 clicked")
+    time.sleep(1)
+    log.info("Starting WIP defect & RM defect process...")
+
+    menu_steps = [
+        "Productivity Analysis",
+        "Production defect analysis",
+        "In-line Scrap Status",
+    ]
+    for step_name in menu_steps:
+        xpath = f"//*[normalize-space(text())='{step_name}']"
+        menu_el, menu_context = find_element_in_default_or_iframes(driver, By.XPATH, xpath, timeout=25)
+        log.info(f"{step_name} found in: {menu_context}")
+        driver.execute_script("arguments[0].scrollIntoView(true);", menu_el)
+        try:
+            menu_el.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", menu_el)
+        log.debug(f"{step_name} clicked")
+        time.sleep(1)
+
+    log.info("Switch iframe...")
+    driver.switch_to.default_content()
+    wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "mainTabControl_contents_56_body")))
+    wait_frame = WebDriverWait(driver, 10)
+
+    input_date = wait_frame.until(EC.presence_of_element_located((By.ID, "txtSearchPeriodEndDate_input")))
+    input_date.clear()
+    yesterday_date = calculate_yesterday_date()
+    input_date.send_keys(yesterday_date)
+    input_date.send_keys(Keys.RETURN)
+    log.info(f"Date set to: {yesterday_date}")
+
+    log.info("Excecuting main search...")
+    inquiry(driver)
+    log.info("Búsqueda iniciada")
+
+    log.info("Starting Excel Download...")
+    download_excel(driver, btn_id="btnGrid1DownloadExcel1", file_name="F_G Defect")
+    log.info("Excel F/G DefectDownloaded")
+    download_excel(driver, btn_id="btnGrid1DownloadExcel2", file_name="R_M Defect")
+    log.info("Excel R/M DefectDownloaded")
+
+    log.info("Processing Excel file and copying to KSI...")
+    process_excel(wb, download_path, log, "F_G Defect", "WIP Defect", 3, 3, 3)
+    process_excel(wb, download_path, log, "R_M Defect", "RM Defect", 3, 3, 3)
+    log.info("WIP defect & RM defect processing completed")
+
+
+def run_def_remain_case(driver, wait, wb, download_path, log):
+    log.info("Starting Def Remain Process...")
+    driver.switch_to.default_content()
+    menu_candidates = [
+        "//*[normalize-space(text())='Defect Confirm action Mgmt.']",
+        "//*[normalize-space(text())='Defect Confirm Action Mgmt.']",
+        "//*[contains(normalize-space(text()), 'Defect Confirm') and contains(normalize-space(text()), 'Mgmt')]",
+    ]
+
+    el1 = None
+    for xpath in menu_candidates:
+        try:
+            el1, _ = find_element_in_default_or_iframes(driver, By.XPATH, xpath, timeout=10)
+            break
+        except TimeoutException:
+            continue
+
+    if el1 is None:
+        raise TimeoutException("Defect Confirm action Mgmt menu not found")
+
+    driver.execute_script("arguments[0].scrollIntoView(true);", el1)
+    try:
+        el1.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el1)
+    log.debug("Defect Confirm action Mgmt. clicked")
+
+    log.info("Switch iframe...")
+    driver.switch_to.frame("mainTabControl_contents_3129_body")
+    wait_frame = WebDriverWait(driver, 10)
+
+    input_date = wait.until(EC.presence_of_element_located((By.ID, "txtSearchPeriodEndDate_input")))
+    input_date.clear()
+    yesterday_date = calculate_yesterday_date()
+    input_date.send_keys(yesterday_date)
+    input_date.send_keys(Keys.RETURN)
+    log.info(f"Date set to: {yesterday_date}")
+    time.sleep(2)
+
+    unconfirmed_button = wait_frame.until(EC.element_to_be_clickable((By.ID, "chbIS_button")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", unconfirmed_button)
+    unconfirmed_button.click()
+    unconfirmed_options = wait_frame.until(EC.presence_of_element_located((By.ID, "chbIS_itemTable_1")))
+    driver.execute_script("arguments[0].scrollIntoView(true);", unconfirmed_options)
+    wait_frame.until(EC.element_to_be_clickable((By.ID, "chbIS_itemTable_1"))).click()
+    log.info("Option 'Unconfirmed' selected")
+
+    log.info("Excecuting main search...")
+    inquiry(driver)
+    log.info("Búsqueda iniciada")
+
+    download_excel(driver, btn_id="btngridDownloadExcel1", file_name="Failure Confirm action Mgmt.")
+    log.info("Excel Downloaded")
+    log.info("Processing Excel file and copying to KSI...")
+    process_excel(
+        wb,
+        download_path,
+        log,
+        "Failure Confirm action Mgmt.",
+        "Def. Remain",
+        3,
+        3,
+        3,
+        cols_to_delete=[2, 3, 12, 13],
+    )
+    log.info("Defect Remain processing completed")
+
+
+def run_selenium(wb,download_path, log):
+    with managed_driver(download_path) as driver:
+        wait = WebDriverWait(driver, 10)
+        log.info(f"Navegando a: {URL}")
+        driver.get(URL)
+
+        try:
+            WebDriverWait(driver, 3).until(EC.alert_is_present())
+            alert = driver.switch_to.alert
+            log.info(f"Alert detected: {alert.text}")
+            alert.accept()
+            log.info("Alert was acepted (OK)")
+        except TimeoutException:
+            log.debug("No alert")
+
+        run_login_case(driver, wait, log)
+        wait_frame = run_itrmqty_case(driver, wait, wb, download_path, log)
+        run_itembar_case(driver, wait_frame, wb, download_path, log)
+        run_mcm_monitoring_case(driver, wait_frame, download_path, log)
+        run_wip_rm_defect_case(driver, wait, wb, download_path, log)
+        run_def_remain_case(driver, wait, wb, download_path, log)
+        log.info("All processes completed successfully")
+               
+def main():
+    validate_env(log)
+    global KSI_WORKING_FILE, MCM_QC_WORKING_FILE
+    wb = None
+    ksi_file = None
+
+    try:
+        log.info("Starting GMES automation...")
+        KSI_WORKING_FILE, MCM_QC_WORKING_FILE = create_daily_monitoring_copies()
+        log.info("Opening main Excel file...")
+        wb, ksi_file = open_main_excel(KSI_WORKING_FILE)
+        run_selenium(wb, download_path, log)
+
+        log.info("Saving changes to KSI Excel file...")
+        wb.save(ksi_file)  # Guardar cambios en el archivo principal de KSI
+        delete_all_excels(get_download_path())  # Limpiar archivos Excel descargados
+    except TimeoutException as e:
+        log.error(f"Timeout esperando elemento: {e}")
+        sys.exit(2)
+    except WebDriverException as e:
+        log.error(f"Error WebDriver: {e}")
+        sys.exit(3)
+    except TimeoutError as e:
+        log.error(f"Descarga no completada: {e}")
+        sys.exit(4)
+    except Exception as e:
+        log.critical(f"An error occurred: {e}")
+        sys.exit(1)
+    finally:
+        if wb is not None:
+            wb.close()  # Cerrar el archivo de Excel
+
+    log.info("✅ Automatización completada exitosamente")
+
+if __name__ == "__main__":
+    main()
