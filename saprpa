@@ -1,0 +1,717 @@
+import configparser
+import datetime
+import logging
+from pathlib import Path
+import subprocess
+import sys
+from openpyxl import load_workbook
+import win32com.client
+import win32gui
+import win32con
+import time
+from datetime import datetime, timedelta
+import os
+import shutil
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_LOG_DIR = os.getenv("DOWNLOAD_LOG_DIR")
+path = os.getenv("KSI_MONITORING_FILE")
+path_sap = os.getenv("SAP_Excel")
+
+def get_base_path():
+    if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+config = configparser.ConfigParser()
+config.read(os.path.join(get_base_path(), 'config.ini'), encoding='utf-8-sig')
+sap_cfg = config['SAP_LOGIN']
+
+user = sap_cfg['user']
+password = sap_cfg['password']
+server = sap_cfg['server']
+
+def setup_logger():
+    log_dir = get_logs_paths()
+    log_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"SAP_KPIMonitoring_{timestamp}.log"
+
+    logger = logging.getLogger("SAP_KPIMonitoring")
+    logger.setLevel(logging.DEBUG)
+
+    # Formato
+    fmt = logging.Formatter(
+        "[%(asctime)s] [%(levelname)-8s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+     # Handler → archivo
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+
+    # Handler → consola
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    logger.info(f"Log started: {log_file}")
+    return logger
+
+
+def get_logs_paths():
+    today = datetime.now().strftime("%y-%m-%d-logs")
+    folder_name = f"logs_{today}"
+    pathlogs = Path(BASE_LOG_DIR) / folder_name
+    pathlogs.mkdir(parents=True, exist_ok=True)
+    return pathlogs
+
+def get_daily_ksi_file() -> str:
+    """Get or create daily copy of KSI_MONITORING_FILE with today's date."""
+    original_ksi = os.getenv("KSI_MONITORING_FILE")
+    if not original_ksi or not Path(original_ksi).exists():
+        raise ValueError(f"KSI_MONITORING_FILE no valido: {original_ksi}")
+    
+    today = datetime.now().strftime("%Y%m%d")
+    ksi_src = Path(original_ksi)
+    ksi_copy = ksi_src.with_name(f"Daily System Closing status_{today}{ksi_src.suffix}")
+    
+    if not ksi_copy.exists():
+        shutil.copy2(ksi_src, ksi_copy)
+        log.info(f"Created daily KSI copy: {ksi_copy}")
+    else:
+        log.info(f"Using existing daily KSI copy: {ksi_copy}")
+    
+    return str(ksi_copy)
+
+
+def get_latest_file(directory, pattern="*"):
+    """Busca el archivo más reciente en una carpeta con un patrón específico.
+    
+    Args:
+        directory: Ruta de la carpeta donde buscar
+        pattern: Patrón de nombre de archivo (ej: "Item Qty_*")
+    
+    Returns:
+        Path del archivo más reciente o None si no encuentra
+    """
+    directory = Path(directory)
+    files = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+def wait_element(session, element, timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            return session.findById(element)
+        except:
+            time.sleep(1)
+    raise Exception(f"Element not found: {element}")
+
+
+def alert_contains(alert_text: str, *expected_fragments: str) -> bool:
+    normalized_alert = (alert_text or "").strip().lower()
+    return any(fragment.strip().lower() in normalized_alert for fragment in expected_fragments)
+
+def read_shell_data(shell) -> list[list]:
+    """
+    Lee todos los datos de un GuiGridView celda por celda.
+
+    Returns:
+        Lista de listas con los valores de cada fila y columna.
+    """
+    rows = shell.rowCount
+    col_count = shell.columnCount
+    data = []
+    for r in range(rows):
+        row = []
+        for c in range(col_count):
+            col_name = shell.columnOrder(c)
+            try:
+                row.append(shell.getCellValue(r, col_name))
+            except Exception:
+                row.append("")
+        data.append(row)
+    return data
+
+
+def export_shell_to_excel(session, shell, export_path: str, filename: str) -> None:
+    """
+    Exporta un GuiGridView a Excel usando el menú nativo de SAP (&MB_EXPORT).
+    Usar para tablas grandes donde leer celda a celda sería lento.
+    No depende del clipboard ni del foco del sistema operativo.
+    """
+    shell.pressToolbarContextButton("&MB_EXPORT")
+    shell.selectContextMenuItem("&XXL")
+    session.findById("wnd[1]/tbar[0]/btn[0]").press()
+    session.findById("wnd[1]/usr/ctxtDY_PATH").text = export_path
+    session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = filename
+    session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = len(filename)
+    session.findById("wnd[1]/tbar[0]/btn[0]").press()
+
+
+def paste_to_sheet(wb, sheet_name: str, data: list[list], start_row: int, start_col: int) -> None:
+    """
+    Escribe una lista de listas en la hoja indicada del workbook.
+
+    Args:
+        wb: Workbook openpyxl abierto.
+        sheet_name: Nombre de la hoja destino.
+        data: Lista de filas, cada fila es una lista de valores.
+        start_row: Fila inicial (1-indexed).
+        start_col: Columna inicial (1-indexed).
+    """
+    ws = wb[sheet_name]
+    for r_idx, row in enumerate(data, start=start_row):
+        for c_idx, value in enumerate(row, start=start_col):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    log.info(f"Data written to sheet '{sheet_name}' ({len(data)} rows)")
+
+def calculate_date():
+    today = datetime.now()
+    first_day_of_month = today.replace(day=1)
+    yesterday = today - timedelta(days=1)
+    current_month = today.strftime("%Y.%m")
+    return first_day_of_month.strftime("%Y.%m.%d"), yesterday.strftime("%Y.%m.%d"), current_month
+
+def delete_excel(path, nameFile):
+    log.info("Cleaning up exported Excel files...")
+    pattern = nameFile
+    if not any(ch in nameFile for ch in "*?[]"):
+        pattern = f"{nameFile}*.xlsx"
+
+    latest_excel = get_latest_file(path, pattern)
+    if latest_excel:
+        try:
+            os.remove(latest_excel)
+            log.info(f"Deleted file: {latest_excel}")
+        except Exception as e:
+            log.error(f"Error deleting file {latest_excel}: {e}")
+    else:
+        log.info("No Excel file found to delete.")
+
+
+def close_excel_workbook_if_open(workbook_name: str, timeout_seconds: int = 8) -> None:
+    """
+    Cierra una ventana de Excel que contenga workbook_name en su titulo.
+    Busca por titulo de ventana (win32gui), lo que funciona independientemente
+    de como SAP haya abierto Excel.
+    """
+    name_lower = (workbook_name or "").lower().strip()
+    name_stem = Path(name_lower).stem
+    deadline = time.time() + timeout_seconds
+    log.info(f"Trying to close Excel workbook: {workbook_name}")
+
+    def _find_and_close():
+        found = []
+
+        def _enum_callback(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd).lower()
+            if name_lower in title or (name_stem and name_stem in title):
+                found.append(hwnd)
+
+        win32gui.EnumWindows(_enum_callback, None)
+
+        for hwnd in found:
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                log.info(f"Sent WM_CLOSE to Excel window with '{workbook_name}' in title")
+            except Exception as e:
+                log.debug(f"Error closing window {hwnd}: {e}")
+        return bool(found)
+
+    # Esperar a que la ventana aparezca y cerrarla
+    while time.time() < deadline:
+        if _find_and_close():
+            time.sleep(0.5)   # dar tiempo a que procese el cierre
+            return
+        time.sleep(0.5)
+
+    log.debug(f"No Excel window with '{workbook_name}' found within {timeout_seconds}s")
+
+
+log = setup_logger()
+
+# ---------------------------------------------------------------------------
+# SAP connection
+# ---------------------------------------------------------------------------
+def open_sap():
+    
+    try:
+        log.info("[LOG] Opening SAP Logon...")
+        os.system("taskkill /f /im saplogon.exe >nul 2>&1")
+        time.sleep(2)
+        subprocess.Popen(r"C:\Program Files (x86)\SAP\FrontEnd\SAPgui\saplogon.exe")
+        time.sleep(10)
+        # Abrir SAP Logon
+        sap_gui = win32com.client.GetObject("SAPGUI")
+        application = sap_gui.GetScriptingEngine
+        # Conexión (0 = primera conexión)
+        connection = application.OpenConnection(server, True)
+        time.sleep(10)
+        # Crear sesión
+        session = connection.Children(0)
+        # Esperar campos login
+        wait_element(session, "wnd[0]/usr/txtRSYST-BNAME")
+        log.info("[LOG] Performing Login...")
+        # Credenciales
+        session.findById("wnd[0]").maximize()        
+        session.findById("wnd[0]/usr/txtRSYST-BNAME").setFocus()
+        session.findById("wnd[0]/usr/txtRSYST-BNAME").text = user
+        session.findById("wnd[0]/usr/pwdRSYST-BCODE").text = password
+        # Enter
+        session.findById("wnd[0]").sendVKey(0)
+
+        return session
+
+    except Exception as e:
+        log.error("Error opening SAP: %s", e)
+        return None
+
+def open_main_excel():
+    ksi_file = get_daily_ksi_file()
+    try:
+        wb = load_workbook(ksi_file)
+        log.info("Main Excel file opened successfully")
+        return wb, ksi_file
+    except Exception as e:
+        log.error(f"Error opening Main Excel file: {e}")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Transactions
+# ---------------------------------------------------------------------------
+
+def item_error(session,wb):
+    log.info("[LOG] Starting SAP data extraction process material check list (ZRPPM2000)...")
+    # Maximizar
+    session.findById("wnd[0]").maximize()
+    # Transacción
+    session.findById("wnd[0]/tbar[0]/okcd").text = "ZRPPM2000"
+    session.findById("wnd[0]").sendVKey(0)
+    # Presionar botón (btn[17])
+    session.findById("wnd[0]/tbar[1]/btn[17]").press()
+    # Seleccionar columna "TEXT" y fila 0 en el ALV
+    alv = session.findById("wnd[1]/usr/cntlALV_CONTAINER_1/shellcont/shell")
+    alv.currentCellColumn = "TEXT"
+    alv.selectedRows = "0"
+    log.info("Waiting for data to load in SAP...")
+    session.findById("wnd[1]/tbar[0]/btn[2]").press()
+    session.findById("wnd[0]/tbar[1]/btn[8]").press()
+    ##################################################
+    wait_element(session, "wnd[0]/usr/cntlCC_0100/shellcont/shell")
+    # Seleccionar todas las filas
+    shell = session.findById("wnd[0]/usr/cntlCC_0100/shellcont/shell")
+    
+    data = read_shell_data(shell)
+    log.info("Data copied from SAP table")
+    paste_to_sheet(wb, "Item Error", data, 2 , 2)
+    session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    
+
+
+def bom_error(session, wb):
+    log.info("[LOG] Starting SAP data extraction process from ZRPPM2010...")
+    # Maximizar
+    session.findById("wnd[0]").maximize()
+    # Transacción
+    session.findById("wnd[0]/tbar[0]/okcd").text = "ZRPPM2010"
+    session.findById("wnd[0]").sendVKey(0)
+    wait_element(session, "wnd[0]/tbar[1]/btn[17]")
+    # Presionar botón en la barra de herramientas
+    session.findById("wnd[0]/tbar[1]/btn[17]").press()
+    # Seleccionar celda en el ALV
+    alv = session.findById("wnd[1]/usr/cntlALV_CONTAINER_1/shellcont/shell")
+    alv.setCurrentCell(1, "TEXT")
+    alv.selectedRows = "1"
+    # Confirmar selección
+    session.findById("wnd[1]/tbar[0]/btn[2]").press()
+    # Desmarcar checkbox
+    chk = session.findById("wnd[0]/usr/chkCB_RECRE")
+    chk.selected = False
+    chk.setFocus()
+    # Ejecutar
+    session.findById("wnd[0]/tbar[1]/btn[8]").press()
+    log.info("Waiting for data to load in SAP...")
+    # Seleccionar celda en otra tabla
+    wait_element(session, "wnd[0]/usr/cntlCC_0100/shellcont/shell")
+    shell = session.findById("wnd[0]/usr/cntlCC_0100/shellcont/shell")
+    
+    data = read_shell_data(shell)
+    log.info("Data copied from SAP table")
+    paste_to_sheet(wb, "BOM Error", data, 2, 1)
+    session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    log.info("ZRPPM2010 extraction complete.")
+
+
+def process_ZRPPS1000(session, wb, first_day_of_month, last_day_of_month):
+    log.info("[LOG] Starting SAP data extraction process from ZRPPS1000...")
+    # Maximizar
+    session.findById("wnd[0]").maximize()
+    # Transacción
+    session.findById("wnd[0]/tbar[0]/okcd").text = "ZRPPS1000"
+    session.findById("wnd[0]").sendVKey(0)
+    session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
+    session.findById("wnd[0]/usr/ctxtS_DATUM-LOW").text = first_day_of_month
+    session.findById("wnd[0]/usr/ctxtS_DATUM-HIGH").text = last_day_of_month
+    session.findById("wnd[0]/usr/ctxtS_DATUM-HIGH").setFocus()
+    session.findById("wnd[0]/usr/ctxtS_DATUM-HIGH").caretPosition = 10
+    log.info("Waiting for data to load in SAP...")
+    session.findById("wnd[0]/tbar[1]/btn[8]").press()
+    
+    summary_shell = session.findById("wnd[0]/shellcont/shell")
+
+    def _get_detail_shell(timeout=10):
+        candidates = [
+            "wnd[0]/shellcont/shell[0]",
+            "wnd[0]/usr/cntlCC_0100/shellcont/shell",
+            "wnd[0]/usr/shellcont/shell",
+        ]
+        start = time.time()
+        while time.time() - start < timeout:
+            for element_id in candidates:
+                try:
+                    return session.findById(element_id)
+                except:
+                    continue
+            time.sleep(0.3)
+        raise Exception("Detail grid not found after drill-down")
+    
+    row_count = summary_shell.RowCount
+    # Última fila
+    last_row = row_count - 1
+    # Penúltima fila
+    second_last_row = row_count - 2
+    # --- Row 3: sheet 12.04 ---
+    summary_shell.setCurrentCell(second_last_row, "ZPRERROR_CNT")
+    cell_value = summary_shell.getCellValue(second_last_row, "ZPRERROR_CNT")
+    cell_value_str = str(cell_value).strip() if cell_value is not None else ""
+
+    if cell_value_str and cell_value_str != "0":
+        log.info(f"Celda 3 contiene: {cell_value_str}, procediendo...")
+        summary_shell.clickCurrentCell()
+        detail = session.findById("wnd[0]/shellcont/shell")
+        detail.setCurrentCell(-1, "")
+        detail.selectAll()
+        data = read_shell_data(detail)
+        paste_to_sheet(wb, "12.04", data, 2, 3)
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    else:
+        log.info("Row 3 empty or 0, skipping 12.04.")
+        
+    # --- Row 4: sheet 12.05 ---
+    summary_shell.setCurrentCell(last_row, "ZPRERROR_CNT")
+    cell_value = summary_shell.getCellValue(last_row, "ZPRERROR_CNT")
+    cell_value_str = str(cell_value).strip() if cell_value is not None else ""
+
+    if cell_value_str and cell_value_str != "0":
+        log.info(f"Celda 4 contiene: {cell_value_str}, procediendo...")
+        summary_shell.clickCurrentCell()
+        time.sleep(1)
+        errores_shell = _get_detail_shell()
+        data = read_shell_data(errores_shell)
+        paste_to_sheet(wb, "12.05", data, 2, 4)
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    else:
+        log.info("Row 4 empty or 0, skipping 12.05.")
+        #session.findById("wnd[0]/tbar[0]/btn[15]").press()
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    log.info("ZRPPS1000 process completed.")
+    
+def process_ZLSDH1000(session, wb, first_day_of_month, last_day_of_month, current_month):
+    log.info("[LOG] Starting SAP data extraction process from ZLSDH1000...")
+    # Maximizar
+    session.findById("wnd[0]").maximize()
+    session.findById("wnd[0]/tbar[0]/okcd").text = "ZLSDH1000"
+    session.findById("wnd[0]").sendVKey(0)
+    session.findById("wnd[0]/usr/ctxtS_BUKRS-LOW").text = "M330"
+    session.findById("wnd[0]/usr/ctxtP_SPMON").text = current_month
+    session.findById("wnd[0]/usr/ctxtP_SPMON").setFocus()
+    session.findById("wnd[0]/usr/ctxtP_SPMON").caretPosition = 7
+    session.findById("wnd[0]/tbar[1]/btn[8]").press()
+    
+    shell = session.findById("wnd[0]/shellcont/shell/shellcont[1]/shell")
+    shell.setCurrentCell(0, "STATUS_ICON")
+    cell_value = shell.getCellValue(0, "STATUS_ICON")
+    print(f"Value in STATUS_ICON: {cell_value}")
+    if cell_value == "@5C@":
+        log.info("STATUS_ICON indicates error, proceeding with data extraction...")
+        session.findById("wnd[0]/shellcont/shell/shellcont[1]/shell").currentCellColumn = "STEP_TXT"
+        session.findById("wnd[0]/shellcont/shell/shellcont[1]/shell").clickCurrentCell()
+        session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
+        session.findById("wnd[0]/usr/ctxtS_BUDAT-LOW").text = first_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_BUDAT-HIGH").text =last_day_of_month
+        session.findById("wnd[0]/usr/radRB_ERROR").setFocus()
+        session.findById("wnd[0]/usr/radRB_ERROR").select()
+        session.findById("wnd[0]/tbar[1]/btn[8]").press()
+        time.sleep(0.5)
+        shell1 = session.findById("wnd[0]/shellcont/shell/shellcont[0]/shell")
+        data = read_shell_data(shell1)
+        paste_to_sheet(wb, "13.00", data, 2, 3)
+
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    elif cell_value == "@5B@":
+        log.info("STATUS_ICON does not indicate error, skipping data extraction.")
+        
+    ########################################################################
+    
+    shell = session.findById("wnd[0]/shellcont/shell/shellcont[1]/shell")
+    shell.setCurrentCell(1, "STATUS_ICON")
+    cell_value = shell.getCellValue(1, "STATUS_ICON")
+    print(f"Value in STATUS_ICON: {cell_value}") 
+    if cell_value == "@5C@":
+        log.info("STATUS_ICON indicates error, proceeding with data extraction...")
+        session.findById("wnd[0]/shellcont/shell/shellcont[1]/shell").currentCellColumn = "STEP_TXT"
+        session.findById("wnd[0]/shellcont/shell/shellcont[1]/shell").clickCurrentCell()
+        session.findById("wnd[0]/usr/ctxtS_BUKRS-LOW").text = "M330"
+        session.findById("wnd[0]/usr/ctxtS_WADAT-LOW").text = first_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_WADAT-HIGH").text = last_day_of_month
+        session.findById("wnd[0]/tbar[1]/btn[8]").press()
+        time.sleep(0.5)
+        # Referencia al grid
+        shell1 = session.findById("wnd[0]/shellcont/shell/shellcont[0]/shell")
+        data = read_shell_data(shell1)
+        paste_to_sheet(wb, "13.00", data, 2, 3)
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    elif cell_value == "@5B@":
+        log.info("STATUS_ICON does not indicate error, skipping data extraction.")
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    log.info("ZLSDH1000 process completed.")
+ 
+ 
+def process_ZLMMI5050(session, wb, first_day_of_month, last_day_of_month, current_month, path):
+    log.info("[LOG] Starting SAP data extraction process from ZLMMI5050...")
+    # Maximizar
+    session.findById("wnd[0]").maximize()
+    # Transacción
+    session.findById("wnd[0]/tbar[0]/okcd").text = "ZLMMI5050"
+    session.findById("wnd[0]").sendVKey(0)
+    session.findById("wnd[0]/usr/ctxtP_SPMON").text = current_month
+    session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
+    session.findById("wnd[0]/tbar[1]/btn[8]").press()
+    time.sleep(0.5)
+    # --- 11.01 ---
+    shell = session.findById("wnd[0]/shellcont/shell")
+    status = shell.getCellValue(0, "STATUS")
+    print(f"11.01 STATUS: {status}")
+    if status == "@5C@":
+        log.info("STATUS indicates error, proceeding with data extraction...")
+        shell.currentCellColumn = "TCODE"
+        shell.clickCurrentCell()
+        session.findById("wnd[0]/usr/ctxtS_ERDAT-LOW").text = first_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_ERDAT-HIGH").text = last_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
+        session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").setFocus()
+        session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").caretPosition = 4
+        session.findById("wnd[0]/tbar[1]/btn[8]").press()
+        time.sleep(0.5)
+        alert =session.findById("wnd[0]/sbar").Text
+        print(f"Alert message: {alert}")
+        log.info(f"Alert message: {alert}")
+        if alert_contains(alert, "no data", "no data found", "Data not found"):
+           log.info("No data found for 11.01, skipping...")
+           session.findById("wnd[0]/tbar[0]/btn[3]").press()
+           #session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        else:
+          #shell1 = session.findById("wnd[0]/shellcont/shell/shellcont[0]/shell")
+          shell1 = session.findById("wnd[0]/shellcont/shell")
+          log.info(f"11.01 detail rows: {shell1.rowCount}")
+          data = read_shell_data(shell1)
+          paste_to_sheet(wb, "11.01", data, 2, 3)
+          session.findById("wnd[0]/tbar[0]/btn[3]").press()
+          session.findById("wnd[0]/tbar[0]/btn[3]").press()
+    elif status == "@5B@":
+        log.info("STATUS does not indicate error, skipping data extraction.")
+    log.info("Intermediate 11.01 complete, proceeding to 11.03...")
+    
+    # --- 11.03 ---
+    shell = session.findById("wnd[0]/shellcont/shell")
+    status = shell.getCellValue(2, "STATUS")
+    print(f"11.03 STATUS: {status}")
+    if status == "@5C@":
+        log.info("STATUS indicates error, proceeding with data extraction...")
+        shell.setCurrentCell(2, "TCODE")
+        shell.clickCurrentCell()
+        session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
+        session.findById("wnd[0]/usr/ctxtS_BLDAT-LOW").text = first_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_BLDAT-HIGH").text = last_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_BLDAT-HIGH").caretPosition = 10
+        session.findById("wnd[0]/tbar[1]/btn[8]").press()
+        alert =session.findById("wnd[0]/sbar").Text 
+        print(f"Alert message: {alert}")
+        log.info(f"Alert message: {alert}")
+        if alert_contains(alert, "no data", "no data found", "Data not found", "User :"):
+           log.info("No data found for 11.03, skipping...")
+           session.findById("wnd[0]/tbar[0]/btn[3]").press()
+           #session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        else:
+          shell = session.findById("wnd[0]/shellcont/shell")
+          total_rows = shell.rowCount
+          log.info(f"11.03 total rows: {total_rows}")
+          # Excluye la última fila (totales) seleccionando 0..n-2
+          shell.selectedRows = f"0-{total_rows - 2}"
+          data = read_shell_data(shell)
+          data = data[:total_rows - 1]  # alineado con la selección original
+          paste_to_sheet(wb, "11.03", data, 2, 3)
+          session.findById("wnd[0]/tbar[0]/btn[3]").press()
+          session.findById("wnd[0]/tbar[0]/btn[3]").press()
+    elif status == "@5B@":
+        log.info("STATUS does not indicate error, skipping data extraction.")   
+    log.info("Intermediate 11.03 complete, proceeding to 11.10...") 
+    
+    # --- 11.10 ---
+    shell = session.findById("wnd[0]/shellcont/shell")
+    status = shell.getCellValue(9, "STATUS")
+    print(f"11.10 STATUS: {status}")
+    if status == "@5C@":
+        log.info("STATUS indicates error, proceeding with data extraction...")
+        shell.setCurrentCell(9, "TCODE")
+        shell.clickCurrentCell()
+        session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
+        session.findById("wnd[0]/usr/ctxtS_BLDAT-LOW").text = first_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_BLDAT-HIGH").text = last_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_BLDAT-HIGH").caretPosition = 10
+        session.findById("wnd[0]/tbar[1]/btn[8]").press()
+
+        shell = session.findById("wnd[0]/shellcont/shell")
+        data = read_shell_data(shell)
+        paste_to_sheet(wb, "11.10", data, 2, 3)
+
+        session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        session.findById("wnd[0]/tbar[0]/btn[3]").press()
+    elif status == "@5B@" or status == "@BZ@":
+        log.info("STATUS does not indicate error, skipping data extraction.")
+    log.info("Intermediate 11.10 complete, proceeding to 11.18...")
+    # --- 11.18 ---
+    shell = session.findById("wnd[0]/shellcont/shell")
+    status = shell.getCellValue(17, "STATUS")
+    print(f"11.18 STATUS: {status}")
+    if status == "@5C@":
+        log.info("STATUS indicates error, proceeding with data extraction...")
+        session.findById("wnd[0]/shellcont/shell").setCurrentCell (17,"TCODE")
+        session.findById("wnd[0]/shellcont/shell").clickCurrentCell()
+        session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
+        session.findById("wnd[0]/usr/ctxtS_BUDAT-LOW").text = first_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_BUDAT-HIGH").text = "2026.05.04"
+        session.findById("wnd[0]/usr/ctxtS_BUDAT-HIGH").setFocus()
+        session.findById("wnd[0]/usr/ctxtS_BUDAT-HIGH").caretPosition = 10
+        session.findById("wnd[0]/tbar[1]/btn[8]").press()
+        alert =session.findById("wnd[0]/sbar").Text
+        print(f"Alert message: {alert}")
+        if alert_contains(alert, "no data", "no data found", "Data not found", "User :"):
+           log.info("No data found for 11.18, skipping...")
+           session.findById("wnd[0]/tbar[0]/btn[3]").press()
+           #session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        else:
+         shell = session.findById("wnd[0]/shellcont/shell")
+         total_rows = shell.rowCount
+         print(f"Total rows in the table: {total_rows}")
+         if total_rows >= 40:
+           log.info("Large table detected, exporting to Excel...")
+           shell.selectAll()
+           export_shell_to_excel(session, shell, path, "backlog.xlsx")
+           time.sleep(1)
+           session.findById("wnd[0]/tbar[0]/btn[3]").press()
+           session.findById("wnd[0]/tbar[0]/btn[3]").press()
+           time.sleep(3)
+           log.info("Invoking close_excel_workbook_if_open for backlog...")
+           close_excel_workbook_if_open("backlog.xlsx", timeout_seconds=20)
+           time.sleep(1)
+
+           log.info(f"[LOG] Processing backlog file from: {path}")
+           latest_excel = get_latest_file(path, "backlog*.xlsx")
+           if not latest_excel:
+               log.error("No backlog file found after export")
+               sys.exit(1)
+
+           log.info(f"Opening backlog file: {latest_excel.name}")
+           wb1 = load_workbook(latest_excel)
+           ws = wb1.active
+
+           log.info("Cleaning up backlog file (removing header row)...")
+           ws.delete_rows(1, 1)
+
+           log.info("Reading data from backlog...")
+           data = [row for row in ws.iter_rows(values_only=True)]
+           wb1.close()
+
+           log.info("Pasting data into 11.18 sheet...")
+           paste_to_sheet(wb, "11.18", data, 2, 3)
+           log.info("Data pasted into 11.18 successfully")
+         else:
+             log.info("11.18: small table, reading cell by cell...")
+             data = read_shell_data(shell)
+             paste_to_sheet(wb, "11.18", data, 2, 3)
+             session.findById("wnd[0]/tbar[0]/btn[3]").press()
+             session.findById("wnd[0]/tbar[0]/btn[3]").press()
+    elif status == "@5B@":
+        log.info("STATUS does not indicate error, skipping data extraction.")
+        session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    log.info("ZLMMI5050 process completed.")
+    log.info("Closing SAP session...")
+    session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    session.findById("wnd[0]/tbar[0]/btn[15]").press()
+    os.system("taskkill /f /im saplogon.exe >nul 2>&1")
+    log.info("All processes completed successfully.")
+    
+def main():
+    completed = False
+    session = None
+    wb = None
+    ksi_file = None
+
+    try:
+        session = open_sap()
+        if session is None:
+            raise RuntimeError("No se pudo abrir sesion en SAP")
+
+        log.info("Opening main Excel file...")
+        wb, ksi_file = open_main_excel()
+
+        item_error(session, wb)
+        bom_error(session, wb)
+        first_day_of_month, yesterday, current_month = calculate_date()
+        process_ZRPPS1000(session, wb, first_day_of_month, yesterday)
+        process_ZLSDH1000(session, wb, first_day_of_month, yesterday, current_month)
+        process_ZLMMI5050(session, wb, first_day_of_month, yesterday, current_month, path_sap)
+        log.info("Saving Excel workbook...")
+        wb.save(ksi_file)
+        log.info(f"Workbook saved: {ksi_file}")
+        delete_excel(path_sap, "backlog")
+        completed = True
+        log.info("Proceso completado correctamente.")
+    except Exception as e:
+        log.exception(f"Proceso no completado. Error en main: {e}")
+    finally:
+        if wb is not None:
+            wb.close()
+            log.info("Workbook closed.")
+            #os.system("taskkill /f /im excel.exe >nul 2>&1")
+            #delete_excel(path_sap, "backlog")
+
+        if not completed:
+            log.error("El proceso no se completo.")
+
+    return completed
+    
+
+if __name__ == "__main__":
+    ok = main()
+    sys.exit(0 if ok else 1)
