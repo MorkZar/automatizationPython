@@ -1,0 +1,290 @@
+import os
+import time
+import win32com.client as win32
+from pathlib import Path
+
+from selenium import webdriver
+from selenium.webdriver import Keys
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as ec
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service as ChromeService
+
+URL = ""  #GA , AL 에 맞게 접속 URL 수정
+USER_ID = ""  #본인 아이디로 수정
+USER_PW = "*"  #본인 비밀번호로 수정
+DOWNLOAD_DIR = r"C:\Users\D\Downloads"  # 다운로드 폴더 실제 경로로 수정
+downloaded_files = []
+
+DRIVER_PATH_FILE = "chromedriver_path.txt"
+
+def get_cached_driver_path():
+    """캐시에 저장된 chromedriver 경로를 읽거나, 없으면 WebDriverManager로 받아서 저장."""
+    # 1) 파일에 경로가 이미 저장되어 있으면 그거 사용
+    if os.path.exists(DRIVER_PATH_FILE):
+        with open(DRIVER_PATH_FILE, "r", encoding="utf-8") as f:
+            path = f.read().strip()
+        if path and os.path.exists(path):
+            return path  # 이미 받아 둔 드라이버 재사용
+
+    # 2) 없으면 WebDriverManager로 최초 한 번 다운로드 (느린 단계)
+    os.environ["WDM_LOCAL"] = "1"  # 받은 후엔 로컬 캐시 우선 사용[web:42]
+    driver_path = ChromeDriverManager().install()  # 여기서만 느릴 수 있음[web:41][web:47]
+
+    # 3) 경로를 파일에 저장해 두고 다음부터는 그대로 사용
+    with open(DRIVER_PATH_FILE, "w", encoding="utf-8") as f:
+        f.write(driver_path)
+
+    return driver_path
+
+
+def switch_to_frame_with_element(driver, by, locator, timeout=10):
+    """주어진 locator를 포함한 iframe을 찾아 그 iframe으로 switch."""
+    wait = WebDriverWait(driver, timeout)
+
+    driver.switch_to.default_content()
+    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+    print("iframe 개수:", len(iframes))
+
+    for idx, frame in enumerate(iframes):
+        driver.switch_to.default_content()
+        driver.switch_to.frame(frame)
+        try:
+            wait.until(ec.presence_of_element_located((by, locator)))
+            print(f">>> 이 프레임에서 {locator} 찾음! index = {idx}")
+            return idx  # 필요한 경우 인덱스를 저장해서 재사용 가능
+        except Exception:
+            continue
+
+    raise Exception(f"어느 iframe에서도 요소 {locator} 를 찾지 못했습니다.")
+
+current_frame = None  # 지금까지 잘 쓰이던 프레임 캐시
+
+
+def find_smart_any_frame(driver, by, locator, timeout=3):
+    global current_frame
+    wait = WebDriverWait(driver, timeout)
+
+    # 1) 먼저 "기존에 잘 되던 프레임"에서만 시도
+    if current_frame is not None:
+        try:
+            driver.switch_to.default_content()
+            driver.switch_to.frame(current_frame)
+            return wait.until(ec.presence_of_element_located((by, locator)))
+        except Exception:
+            pass  # 여기서 못 찾으면 아래로 내려가서 전체 탐색
+
+    # 2) 실패하면 전체 iframe을 돌면서 다시 탐색
+    driver.switch_to.default_content()
+    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+
+    for frame in iframes:
+        driver.switch_to.default_content()
+        driver.switch_to.frame(frame)
+        try:
+            elem = wait.until(ec.presence_of_element_located((by, locator)))
+            # 이 프레임이 유효하다는 걸 알았으니 캐시에 저장
+            current_frame = frame
+            return elem
+        except Exception:
+            continue
+
+    raise Exception(f"어느 iframe에서도 요소 {locator} 를 찾지 못했습니다.")
+
+
+def find_in_any_frame(driver, by, locator, timeout=10):
+    """여러 iframe 중 해당 요소를 포함한 프레임을 찾아 진입 후 요소 반환."""
+    driver.switch_to.default_content()
+    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+    wait = WebDriverWait(driver, timeout)
+
+    for frame in iframes:
+        driver.switch_to.default_content()
+        driver.switch_to.frame(frame)
+        try:
+            elem = wait.until(ec.presence_of_element_located((by, locator)))
+            return elem
+        except Exception:
+            continue
+
+    raise Exception(f"어느 iframe에서도 요소 {locator} 를 찾지 못했습니다.")
+
+
+def wait_for_new_file(download_dir, seen_files, timeout=120):
+    """seen_files 이후 '완료된' 새 파일(.tmp/.crdownload 제외)을 기다린다."""
+    folder = Path(download_dir)
+    start = time.time()
+
+    while time.time() - start < timeout:
+        time.sleep(1)
+
+        # 폴더 내 파일 목록
+        current_files = {f.name for f in folder.glob("*")}
+
+        # 아직 임시 파일(.tmp, .crdownload)이 남아 있으면 그냥 계속 기다림
+        if any(
+            name.endswith((".tmp", ".crdownload", ".part"))
+            for name in current_files
+        ):
+            continue
+
+        # seen_files 이후에 생긴 '완료된' 새 파일들만 필터
+        new_files = current_files - seen_files
+        if new_files:
+            latest = max(
+                new_files,
+                key=lambda n: (folder / n).stat().st_mtime
+            )
+            return str(folder / latest)
+
+    raise TimeoutError("다운로드 완료 파일을 찾지 못했습니다.")
+
+
+def send_mail_with_attachments(attachment_paths):
+    outlook = win32.Dispatch("Outlook.Application")
+    mail = outlook.CreateItem(0)
+
+    mail.To = ""  #To 정보
+    mail.CC = ""  #Cc 정보
+    mail.Subject = "GMES 재고 엑셀 자동전송"  #이메일 제목 수정하려면 여기 수정
+    mail.Body = "Inventory Status Display 재고 조회 자동 전송\n 전 Plant\n RPA 테스트 완료\n"  #이메일 내용 수정하려면 여기 수정
+
+    for path in attachment_paths:
+        print("첨부 시도 파일:", path)
+        if not os.path.exists(path):
+            print("⚠ 파일이 실제로 없음:", path)
+            continue  # 존재하지 않으면 첨부 건너뛰기
+
+        # 절대 경로 보장 (혹시 모를 문제 방지)
+        abs_path = str(Path(path).resolve())
+        print("실제 첨부 경로:", abs_path)
+        mail.Attachments.Add(abs_path)
+    mail.Send()
+
+
+def main():
+    driver_path = get_cached_driver_path()
+    service = ChromeService(executable_path=driver_path)
+    driver = webdriver.Chrome(service=service)
+
+    try:
+        driver.get(URL)
+        driver.implicitly_wait(10)
+
+        # 로그인
+        id_input = driver.find_element(By.ID, "txtUSER_ID")
+        pw_input = driver.find_element(By.ID, "txtPWD")
+
+        id_input.clear()
+        id_input.send_keys(USER_ID)
+        pw_input.clear()
+        pw_input.send_keys(USER_PW)
+
+        login_btn = driver.find_element(By.ID, "btnLogin")
+        login_btn.click()
+
+        wait = WebDriverWait(driver, 10)
+
+        # 네비 버튼 : SCL 카테고리 클릭
+        nav_btn = wait.until(ec.element_to_be_clickable((By.ID, "btn_nav02")))
+        nav_btn.click()
+
+        # 중메뉴 : Inventory Mgmt. 클릭
+        mid_menu = wait.until(
+            ec.element_to_be_clickable(
+                (By.CSS_SELECTOR, "div[title='Inventory Mgmt.']")
+            )
+        )
+        driver.execute_script("arguments[0].click();", mid_menu)
+
+        # 실제 타겟 메뉴 : Inventory Status Display 클릭
+        target_menu = wait.until(
+            ec.element_to_be_clickable(
+                (By.CSS_SELECTOR, "div.label.depth3[title='Inventory Status Display']")
+            )
+        )
+        target_menu.click()
+
+        # ERP QTY 체크박스 체크하기
+        erp_qty = find_smart_any_frame(driver, By.ID, "chkRFC_input_0")
+        erp_qty.click()
+
+        # 콤보박스 클릭해서 드롭다운 열기
+        combo = find_smart_any_frame(driver, By.ID, "cboSearchPlant_button")
+        combo.click()
+        time.sleep(0.3)
+
+        # 드롭다운 항목 전체 개수 찾기
+        options = driver.find_elements(
+            By.XPATH, "//td[starts-with(@id, 'cboSearchPlant_itemTable_')]"
+        )
+        option_count = len(options)
+        opt = options[option_count - 1]
+        opt.click()
+
+        folder = Path(DOWNLOAD_DIR)
+        seen_files = {f.name for f in folder.glob("*")}
+
+        for i in range(option_count):
+            combo = find_smart_any_frame(driver, By.ID, "cboSearchPlant_button")
+            combo.click()
+            time.sleep(0.3)
+
+            options = driver.find_elements(
+                By.XPATH, "//td[starts-with(@id, 'cboSearchPlant_itemTable_')]"
+            )
+            opt = options[i]
+            print(i, opt.get_attribute("id"), " / text =", opt.text)
+            opt.click()
+
+            btn_inquiry = find_smart_any_frame(driver, By.ID, "btnMainSearch")
+            btn_inquiry.click()
+
+            # 조회 후 로딩바 사라질 때까지 대기
+            try:
+                WebDriverWait(driver, 10).until(
+                    ec.invisibility_of_element_located((By.ID, "loadingBar"))
+                )
+            except Exception:
+                pass
+
+            rows = wait.until(
+                ec.presence_of_all_elements_located(
+                    (By.CSS_SELECTOR, "#grid1_cell_0_0")
+                )
+            )
+
+            # 다운로드 전에도 한 번 더 체크 (짧게)
+            try:
+                WebDriverWait(driver, 5).until(
+                    ec.invisibility_of_element_located((By.ID, "loadingBar"))
+                )
+            except Exception:
+                pass
+
+            btn_download_excel = find_smart_any_frame(driver, By.ID, "btnGrid1ExcelDownload")
+            btn_download_excel.click()
+
+            time.sleep(0.5)
+            body = driver.find_element(By.TAG_NAME, "body")
+            body.send_keys(Keys.ENTER)
+
+            # 실제 파일이 다운로드될 때까지 대기 (이전까지 본 파일 기준)
+            excel_path = wait_for_new_file(DOWNLOAD_DIR, seen_files, timeout=120)
+            print("다운로드 완료 파일:", excel_path, "존재 여부:", os.path.exists(excel_path))
+            downloaded_files.append(excel_path)
+
+            # 이번에 받은 파일을 seen_files에 추가
+            seen_files.add(Path(excel_path).name)
+
+        send_mail_with_attachments(downloaded_files)
+
+
+    finally:
+        driver.quit()
+
+
+if __name__ == "__main__":
+    main()
