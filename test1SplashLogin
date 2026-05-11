@@ -1,0 +1,137 @@
+import subprocess
+import selenium
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import TimeoutException, WebDriverException
+import time
+import os
+import requests
+import dotenv
+
+dotenv.load_dotenv()
+
+user = os.getenv("APP_USER")
+password = os.getenv("APP_PASSWORD")
+
+
+carpeta_proyecto = r"C:\Users\elchi\proyectoDS1\proyectoDS2.0"
+ruta_docker_compose = os.path.join(r'C:\Program Files\Docker\Docker\Docker Desktop.exe')
+chrome_driver_path = r"C:\Users\elchi\testSplash\chromedriver.exe"
+
+def esperar_docker():
+
+    while True:
+        try:
+            resultado = subprocess.run(
+                "docker info",
+                shell=True,
+                capture_output=True,
+                text=True
+            )
+
+            if resultado.returncode == 0:
+                print("Docker listo")
+                break
+
+        except:
+            pass
+
+        print("Esperando Docker...")
+        time.sleep(2)
+
+
+#Abrir Command Prompt  y Docker Desktop
+def abrir_terminal_cmd():
+    # Abrir Docker Desktop
+    subprocess.Popen(ruta_docker_compose)
+
+    esperar_docker()
+
+    print("Esperando Docker...")
+
+    # Ejecutar docker compose en CMD carpeta del proyecto
+    subprocess.Popen(
+    'docker compose up -d',
+    cwd=carpeta_proyecto,
+    shell=True
+    )
+
+    print("Iniciando contenedores...")
+
+def esperar_frontend():
+
+    url = "http://localhost:4201/login"
+
+    while True:
+        try:
+            response = requests.get(url, timeout=3)
+
+            if response.status_code == 200:
+                print("Frontend listo")
+                break
+
+        except:
+            pass
+
+        print("Esperando frontend...")
+        time.sleep(2)
+    
+
+if __name__ == "__main__":
+    abrir_terminal_cmd() 
+    time.sleep(1) 
+    esperar_frontend()
+
+    chrome_options = Options()
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--disable-infobars")
+    chrome_options.add_argument("--disable-extensions")
+    #chrome_options.add_argument("--disable-gpu")
+
+    service = Service(chrome_driver_path)
+
+    driver = webdriver.Chrome(service = service, options=chrome_options)
+    driver.get("http://localhost:4201/login")
+    time.sleep(1)
+
+    # Encontrar los campos de usuario y contraseña e ingresar los datos
+    username_field = driver.find_element(By.ID, "usuario") 
+    username_field.send_keys(user)
+    password_field = driver.find_element(By.ID, "password")  
+    password_field.send_keys(password)  
+    btn_login = driver.find_element(By.XPATH, "//button[@type='submit']")
+    btn_login.click()
+
+    # Esperar a que aparezca el elemento de bienvenida después del login
+    try:
+        wait = WebDriverWait(driver, 10)
+        welcome_element = wait.until(
+            EC.presence_of_element_located((By.TAG_NAME, "h1"))
+        )
+        
+        # Verificar que contiene el texto esperado
+        if "Bienvenido a Splash" in welcome_element.text:
+            print("TEST EXITOSO: Login fue exitoso, elemento encontrado: " + welcome_element.text)
+        else:
+            print("✗ TEST FALLIDO: Elemento h1 encontrado pero no contiene el texto esperado")
+            print("Texto encontrado: " + welcome_element.text)
+    
+    except TimeoutException:
+        print("TEST FALLIDO: No se encontró el elemento de bienvenida después de 10 segundos")
+
+    driver.quit()
+    print("Tumbando Contenedores...")
+    subprocess.Popen(
+    'docker compose down',
+    cwd=carpeta_proyecto,
+    shell=True
+    )
+    time.sleep(5)
+    
+    print("Docker completamente cerrado")
