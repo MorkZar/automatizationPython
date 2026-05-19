@@ -11,7 +11,6 @@ import win32con
 import time
 from datetime import datetime, timedelta
 import os
-import shutil
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,6 +18,8 @@ load_dotenv()
 BASE_LOG_DIR = os.getenv("DOWNLOAD_LOG_DIR")
 path = os.getenv("KSI_MONITORING_FILE")
 path_sap = os.getenv("SAP_Excel")
+SAP = os.getenv("SAP")
+temp_file = Path(r"M:\Management\IT\Share\00. N-ERP\Monitoring\KPI RPA Template")
 
 def get_base_path():
     if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
@@ -72,34 +73,11 @@ def get_logs_paths():
     pathlogs.mkdir(parents=True, exist_ok=True)
     return pathlogs
 
-def get_daily_ksi_file() -> str:
-    """Get or create daily copy of KSI_MONITORING_FILE with today's date."""
-    original_ksi = os.getenv("KSI_MONITORING_FILE")
-    if not original_ksi or not Path(original_ksi).exists():
-        raise ValueError(f"KSI_MONITORING_FILE no valido: {original_ksi}")
-    
-    today = datetime.now().strftime("%Y%m%d")
-    ksi_src = Path(original_ksi)
-    ksi_copy = ksi_src.with_name(f"Daily System Closing status_{today}{ksi_src.suffix}")
-    
-    if not ksi_copy.exists():
-        shutil.copy2(ksi_src, ksi_copy)
-        log.info(f"Created daily KSI copy: {ksi_copy}")
-    else:
-        log.info(f"Using existing daily KSI copy: {ksi_copy}")
-    
-    return str(ksi_copy)
-
-
 def get_latest_file(directory, pattern="*"):
-    """Busca el archivo más reciente en una carpeta con un patrón específico.
-    
+    """
     Args:
         directory: Ruta de la carpeta donde buscar
         pattern: Patrón de nombre de archivo (ej: "Item Qty_*")
-    
-    Returns:
-        Path del archivo más reciente o None si no encuentra
     """
     directory = Path(directory)
     files = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -122,9 +100,6 @@ def alert_contains(alert_text: str, *expected_fragments: str) -> bool:
 def read_shell_data(shell) -> list[list]:
     """
     Lee todos los datos de un GuiGridView celda por celda.
-
-    Returns:
-        Lista de listas con los valores de cada fila y columna.
     """
     rows = shell.rowCount
     col_count = shell.columnCount
@@ -142,11 +117,6 @@ def read_shell_data(shell) -> list[list]:
 
 
 def export_shell_to_excel(session, shell, export_path: str, filename: str) -> None:
-    """
-    Exporta un GuiGridView a Excel usando el menú nativo de SAP (&MB_EXPORT).
-    Usar para tablas grandes donde leer celda a celda sería lento.
-    No depende del clipboard ni del foco del sistema operativo.
-    """
     shell.pressToolbarContextButton("&MB_EXPORT")
     shell.selectContextMenuItem("&XXL")
     session.findById("wnd[1]/tbar[0]/btn[0]").press()
@@ -158,8 +128,6 @@ def export_shell_to_excel(session, shell, export_path: str, filename: str) -> No
 
 def paste_to_sheet(wb, sheet_name: str, data: list[list], start_row: int, start_col: int) -> None:
     """
-    Escribe una lista de listas en la hoja indicada del workbook.
-
     Args:
         wb: Workbook openpyxl abierto.
         sheet_name: Nombre de la hoja destino.
@@ -180,6 +148,28 @@ def calculate_date():
     current_month = today.strftime("%Y.%m")
     return first_day_of_month.strftime("%Y.%m.%d"), yesterday.strftime("%Y.%m.%d"), current_month
 
+def get_date_range():
+    """
+    Si hoy es la primera semana del mes (días 1-7):
+        → rango: hace 7 días hasta ayer
+    Si no es la primera semana:
+        → rango: primer día del mes hasta ayer
+    
+    Returns:
+        tuple: (start_date, end_date) en formato "YYYY.MM.DD"
+    """
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    
+    is_first_week = today.day <= 7
+    
+    if is_first_week:
+        start_date = today - timedelta(days=7)
+    else:
+        start_date = today.replace(day=1)
+    
+    return start_date.strftime("%Y.%m.%d"), yesterday.strftime("%Y.%m.%d")
+
 def delete_excel(path, nameFile):
     log.info("Cleaning up exported Excel files...")
     pattern = nameFile
@@ -198,11 +188,6 @@ def delete_excel(path, nameFile):
 
 
 def close_excel_workbook_if_open(workbook_name: str, timeout_seconds: int = 8) -> None:
-    """
-    Cierra una ventana de Excel que contenga workbook_name en su titulo.
-    Busca por titulo de ventana (win32gui), lo que funciona independientemente
-    de como SAP haya abierto Excel.
-    """
     name_lower = (workbook_name or "").lower().strip()
     name_stem = Path(name_lower).stem
     deadline = time.time() + timeout_seconds
@@ -228,10 +213,9 @@ def close_excel_workbook_if_open(workbook_name: str, timeout_seconds: int = 8) -
                 log.debug(f"Error closing window {hwnd}: {e}")
         return bool(found)
 
-    # Esperar a que la ventana aparezca y cerrarla
     while time.time() < deadline:
         if _find_and_close():
-            time.sleep(0.5)   # dar tiempo a que procese el cierre
+            time.sleep(0.5) 
             return
         time.sleep(0.5)
 
@@ -243,22 +227,31 @@ log = setup_logger()
 # ---------------------------------------------------------------------------
 # SAP connection
 # ---------------------------------------------------------------------------
-def open_sap():
+def open_sap(timeout=30):
     
     try:
         log.info("[LOG] Opening SAP Logon...")
         os.system("taskkill /f /im saplogon.exe >nul 2>&1")
         time.sleep(2)
-        subprocess.Popen(r"C:\Program Files (x86)\SAP\FrontEnd\SAPgui\saplogon.exe")
-        time.sleep(10)
-        # Abrir SAP Logon
-        sap_gui = win32com.client.GetObject("SAPGUI")
-        application = sap_gui.GetScriptingEngine
-        # Conexión (0 = primera conexión)
-        connection = application.OpenConnection(server, True)
-        time.sleep(10)
-        # Crear sesión
-        session = connection.Children(0)
+        subprocess.Popen(SAP)
+        
+        session = None
+        for i in range(30):  # hasta 30 segundos de espera
+            time.sleep(1)
+            try:
+                sap_gui = win32com.client.GetObject("SAPGUI")
+                application = sap_gui.GetScriptingEngine
+                connection = application.OpenConnection(server, True)
+                session = connection.Children(0)
+                log.info("[LOG] SAP GUI Engine connected.")
+                break
+            except Exception:
+                if i % 5 == 0:
+                    log.info(f"[LOG] Waiting for SAP... ({i}s)")
+
+        if not session:
+            raise Exception("SAP Connection Failed")
+
         # Esperar campos login
         wait_element(session, "wnd[0]/usr/txtRSYST-BNAME")
         log.info("[LOG] Performing Login...")
@@ -277,9 +270,13 @@ def open_sap():
         return None
 
 def open_main_excel():
-    ksi_file = get_daily_ksi_file()
+    ksi_file = get_latest_file(temp_file, "Daily System Closing status_*.xls*")
+    if not ksi_file:
+        log.error("No daily KSI file found")
+        sys.exit(1)
     try:
-        wb = load_workbook(ksi_file)
+        log.info(f"KSI full path:      {ksi_file}")
+        wb = load_workbook(ksi_file, keep_links=True)
         log.info("Main Excel file opened successfully")
         return wb, ksi_file
     except Exception as e:
@@ -421,7 +418,7 @@ def process_ZRPPS1000(session, wb, first_day_of_month, last_day_of_month):
         time.sleep(1)
         errores_shell = _get_detail_shell()
         data = read_shell_data(errores_shell)
-        paste_to_sheet(wb, "12.05", data, 2, 4)
+        paste_to_sheet(wb, "12.05", data, 2, 3)
         session.findById("wnd[0]/tbar[0]/btn[15]").press()
         session.findById("wnd[0]/tbar[0]/btn[15]").press()
     else:
@@ -457,12 +454,20 @@ def process_ZLSDH1000(session, wb, first_day_of_month, last_day_of_month, curren
         session.findById("wnd[0]/usr/radRB_ERROR").select()
         session.findById("wnd[0]/tbar[1]/btn[8]").press()
         time.sleep(0.5)
-        shell1 = session.findById("wnd[0]/shellcont/shell/shellcont[0]/shell")
-        data = read_shell_data(shell1)
-        paste_to_sheet(wb, "13.00", data, 2, 3)
+        alert = session.findById("wnd[0]/sbar").Text
+        print(f"Alert message: {alert}")
+        log.info(f"Alert message: {alert}")
+        if alert_contains(alert, "no data", "no data found", "Data not found"):
+           log.info("No data found for Row 0, skipping...")
+           session.findById("wnd[0]/tbar[0]/btn[15]").press()
+           session.findById("wnd[0]/tbar[0]/btn[15]").press()
+        else:
+           shell1 = session.findById("wnd[0]/shellcont/shell/shellcont[0]/shell")
+           data = read_shell_data(shell1)
+           paste_to_sheet(wb, "13.00", data, 2, 3)
 
-        session.findById("wnd[0]/tbar[0]/btn[15]").press()
-        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+           session.findById("wnd[0]/tbar[0]/btn[15]").press()
+           session.findById("wnd[0]/tbar[0]/btn[15]").press()
     elif cell_value == "@5B@":
         log.info("STATUS_ICON does not indicate error, skipping data extraction.")
         
@@ -481,12 +486,20 @@ def process_ZLSDH1000(session, wb, first_day_of_month, last_day_of_month, curren
         session.findById("wnd[0]/usr/ctxtS_WADAT-HIGH").text = last_day_of_month
         session.findById("wnd[0]/tbar[1]/btn[8]").press()
         time.sleep(0.5)
-        # Referencia al grid
-        shell1 = session.findById("wnd[0]/shellcont/shell/shellcont[0]/shell")
-        data = read_shell_data(shell1)
-        paste_to_sheet(wb, "13.00", data, 2, 3)
-        session.findById("wnd[0]/tbar[0]/btn[15]").press()
-        session.findById("wnd[0]/tbar[0]/btn[15]").press()
+        alert = session.findById("wnd[0]/sbar").Text
+        print(f"Alert message: {alert}")
+        log.info(f"Alert message: {alert}")
+        if alert_contains(alert, "no data", "no data found", "Data not found"):
+           log.info("No data found for Row 1, skipping...")
+           session.findById("wnd[0]/tbar[0]/btn[15]").press()
+           session.findById("wnd[0]/tbar[0]/btn[15]").press()
+        else:
+            # Referencia al grid
+            shell1 = session.findById("wnd[0]/shellcont/shell/shellcont[0]/shell")
+            data = read_shell_data(shell1)
+            paste_to_sheet(wb, "13.01", data, 2, 3)
+            session.findById("wnd[0]/tbar[0]/btn[15]").press()
+            session.findById("wnd[0]/tbar[0]/btn[15]").press()
     elif cell_value == "@5B@":
         log.info("STATUS_ICON does not indicate error, skipping data extraction.")
         session.findById("wnd[0]/tbar[0]/btn[15]").press()
@@ -501,10 +514,12 @@ def process_ZLMMI5050(session, wb, first_day_of_month, last_day_of_month, curren
     # Transacción
     session.findById("wnd[0]/tbar[0]/okcd").text = "ZLMMI5050"
     session.findById("wnd[0]").sendVKey(0)
+    time.sleep(1)
     session.findById("wnd[0]/usr/ctxtP_SPMON").text = current_month
     session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
     session.findById("wnd[0]/tbar[1]/btn[8]").press()
     time.sleep(0.5)
+    log.info("Start process 11.01...")
     # --- 11.01 ---
     shell = session.findById("wnd[0]/shellcont/shell")
     status = shell.getCellValue(0, "STATUS")
@@ -515,6 +530,8 @@ def process_ZLMMI5050(session, wb, first_day_of_month, last_day_of_month, curren
         shell.clickCurrentCell()
         session.findById("wnd[0]/usr/ctxtS_ERDAT-LOW").text = first_day_of_month
         session.findById("wnd[0]/usr/ctxtS_ERDAT-HIGH").text = last_day_of_month
+        print(f"Set date range: {first_day_of_month} - {last_day_of_month}")
+        log.info(f"Set date range: {first_day_of_month} - {last_day_of_month}")
         session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
         session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").setFocus()
         session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").caretPosition = 4
@@ -582,18 +599,23 @@ def process_ZLMMI5050(session, wb, first_day_of_month, last_day_of_month, curren
         log.info("STATUS indicates error, proceeding with data extraction...")
         shell.setCurrentCell(9, "TCODE")
         shell.clickCurrentCell()
+        #BLDAT
         session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
-        session.findById("wnd[0]/usr/ctxtS_BLDAT-LOW").text = first_day_of_month
-        session.findById("wnd[0]/usr/ctxtS_BLDAT-HIGH").text = last_day_of_month
-        session.findById("wnd[0]/usr/ctxtS_BLDAT-HIGH").caretPosition = 10
+        session.findById("wnd[0]/usr/ctxtS_ERDAT-LOW").text = first_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_ERDAT-HIGH").text = last_day_of_month
+        session.findById("wnd[0]/usr/ctxtS_ERDAT-HIGH").caretPosition = 10
         session.findById("wnd[0]/tbar[1]/btn[8]").press()
-
-        shell = session.findById("wnd[0]/shellcont/shell")
-        data = read_shell_data(shell)
-        paste_to_sheet(wb, "11.10", data, 2, 3)
-
-        session.findById("wnd[0]/tbar[0]/btn[3]").press()
-        session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        alert =session.findById("wnd[0]/sbar").Text
+        print(f"Alert message: {alert}")
+        if alert_contains(alert, "no data", "no data found", "Data not found", "User :"):
+           log.info("No data found for 11.10, skipping...")
+           session.findById("wnd[0]/tbar[0]/btn[3]").press()
+        else:
+           shell = session.findById("wnd[0]/shellcont/shell")
+           data = read_shell_data(shell)
+           paste_to_sheet(wb, "11.10", data, 2, 3)
+           session.findById("wnd[0]/tbar[0]/btn[3]").press()
+           session.findById("wnd[0]/tbar[0]/btn[3]").press()
     elif status == "@5B@" or status == "@BZ@":
         log.info("STATUS does not indicate error, skipping data extraction.")
     log.info("Intermediate 11.10 complete, proceeding to 11.18...")
@@ -607,7 +629,7 @@ def process_ZLMMI5050(session, wb, first_day_of_month, last_day_of_month, curren
         session.findById("wnd[0]/shellcont/shell").clickCurrentCell()
         session.findById("wnd[0]/usr/ctxtS_WERKS-LOW").text = "3301"
         session.findById("wnd[0]/usr/ctxtS_BUDAT-LOW").text = first_day_of_month
-        session.findById("wnd[0]/usr/ctxtS_BUDAT-HIGH").text = "2026.05.04"
+        session.findById("wnd[0]/usr/ctxtS_BUDAT-HIGH").text = last_day_of_month
         session.findById("wnd[0]/usr/ctxtS_BUDAT-HIGH").setFocus()
         session.findById("wnd[0]/usr/ctxtS_BUDAT-HIGH").caretPosition = 10
         session.findById("wnd[0]/tbar[1]/btn[8]").press()
@@ -668,9 +690,8 @@ def process_ZLMMI5050(session, wb, first_day_of_month, last_day_of_month, curren
     log.info("Closing SAP session...")
     session.findById("wnd[0]/tbar[0]/btn[15]").press()
     session.findById("wnd[0]/tbar[0]/btn[15]").press()
-    os.system("taskkill /f /im saplogon.exe >nul 2>&1")
     log.info("All processes completed successfully.")
-    
+     
 def main():
     completed = False
     session = None
@@ -688,12 +709,14 @@ def main():
         item_error(session, wb)
         bom_error(session, wb)
         first_day_of_month, yesterday, current_month = calculate_date()
-        process_ZRPPS1000(session, wb, first_day_of_month, yesterday)
+        start, end = get_date_range()
+        process_ZRPPS1000(session, wb, start, end)
         process_ZLSDH1000(session, wb, first_day_of_month, yesterday, current_month)
-        process_ZLMMI5050(session, wb, first_day_of_month, yesterday, current_month, path_sap)
+        process_ZLMMI5050(session, wb, start, end, current_month, path_sap)
         log.info("Saving Excel workbook...")
         wb.save(ksi_file)
         log.info(f"Workbook saved: {ksi_file}")
+        os.system("taskkill /f /im saplogon.exe >nul 2>&1")
         delete_excel(path_sap, "backlog")
         completed = True
         log.info("Proceso completado correctamente.")
@@ -703,9 +726,6 @@ def main():
         if wb is not None:
             wb.close()
             log.info("Workbook closed.")
-            #os.system("taskkill /f /im excel.exe >nul 2>&1")
-            #delete_excel(path_sap, "backlog")
-
         if not completed:
             log.error("El proceso no se completo.")
 
