@@ -9,7 +9,6 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from dotenv import load_dotenv
 from selenium.webdriver.common.keys import Keys
 import os
-import shutil
 import time
 import logging
 import sys
@@ -19,6 +18,7 @@ from openpyxl import load_workbook
 from contextlib import contextmanager
 import win32com
 import win32com.client
+import shutil   
 load_dotenv()
 
 # =========================
@@ -74,51 +74,57 @@ def delete_all_excels(path: str) -> None:
         log.info("Excel cleanup completed.")
     except Exception as e:
         log.error(f"Error accessing folder {path}: {e}")
+        
 
 # =========================
 # CONFIGURACIÓN
 # =========================
 load_dotenv()
+DRIVER_PATH_FILE = "chromedriver_path.txt"
 URL      = os.getenv("URL_GMES")
 USUARIO  = os.getenv("GMES_USER")
 PASSWORD = os.getenv("GMES_PASS")
 BASE_DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR")
 BASE_LOG_DIR = os.getenv("DOWNLOAD_LOG_DIR")
-KSI_FILE = os.getenv("KSI_MONITORING_FILE")
-MCM_QC_FILE = os.getenv("MCM_QC_INV_MONITORING_FILE")
-KSI_WORKING_FILE = None
-MCM_QC_WORKING_FILE = None
+KPI_TEMPLATE_DIR = Path(os.getenv("KPI_TEMPLATE_DIR"))
+LOCAL_TEMP_DIR   = Path(os.getenv("LOCAL_TEMP_DIR"))
 log = setup_logger()
 
 
-def create_daily_monitoring_copies() -> tuple[str, str]:
-    """Create daily working copies for KSI and MCM monitoring files."""
-    if not KSI_FILE or not Path(KSI_FILE).exists():
-        raise ValueError(f"KSI_MONITORING_FILE no valido: {KSI_FILE}")
-    if not MCM_QC_FILE or not Path(MCM_QC_FILE).exists():
-        raise ValueError(f"MCM_QC_INV_MONITORING_FILE no valido: {MCM_QC_FILE}")
+def get_cached_driver_path():
+    """Lee driver guardado o descarga uno nuevo."""
 
-    today = datetime.now().strftime("%Y%m%d")
+    # Revisar si ya existe archivo con la ruta
+    if Path(DRIVER_PATH_FILE).exists():
 
-    ksi_src = Path(KSI_FILE)
-    ksi_copy = ksi_src.with_name(f"Daily System Closing status_{today}{ksi_src.suffix}")
-    if not ksi_copy.exists():
-        shutil.copy2(ksi_src, ksi_copy)
-        log.info(f"Created daily KSI copy: {ksi_copy}")
-    else:
-        log.info(f"Using existing daily KSI copy: {ksi_copy}")
+        with open(DRIVER_PATH_FILE, "r", encoding="utf-8") as f:
+            path = f.read().strip()
 
-    mcm_src = Path(MCM_QC_FILE)
-    mcm_copy = mcm_src.with_name(f"MCM QC Inv Monitoring_{today}{mcm_src.suffix}")
-    if not mcm_copy.exists():  # ← Y aquí también
-        shutil.copy2(mcm_src, mcm_copy)
-        log.info(f"Created daily MCM QC copy: {mcm_copy}")
-    else:
-        log.info(f"Using existing daily MCM QC copy: {mcm_copy}")
+        # Verificar que el driver todavía exista
+        if path and os.path.exists(path):
+            log.info(f"Using cached ChromeDriver: {path}")
+            return path
 
-    log.info(f"Created daily KSI copy: {ksi_copy}")
-    log.info(f"Created daily MCM QC copy: {mcm_copy}")
-    return str(ksi_copy), str(mcm_copy)
+    # Si no existe → descargar
+    log.info("Downloading new ChromeDriver...")
+
+    os.environ["WDM_LOCAL"] = "1"
+
+    driver_path = ChromeDriverManager().install()
+
+    # Guardar ruta
+    with open(DRIVER_PATH_FILE, "w", encoding="utf-8") as f:
+        f.write(driver_path)
+
+    log.info(f"ChromeDriver downloaded: {driver_path}")
+
+    return driver_path
+
+def get_mcm_qc_file(download_path):
+    file = get_latest_file(download_path, "MCM QC Inv Monitoring_*.xlsx")
+    if not file:
+        raise FileNotFoundError("MCM QC working file no inicializado")
+    return file
 
 def get_download_path():
     """Devuelve BASE_DIR/YYYY-MM-DD y crea la carpeta si no existe."""
@@ -149,7 +155,7 @@ def get_date_range():
     
     return start_date.strftime("%Y.%m.%d"), yesterday.strftime("%Y.%m.%d")
 
-start, end = get_date_range()
+#start, end = get_date_range()
 
 def get_latest_file(directory, pattern="*"):
     """Busca el archivo más reciente en una carpeta con un patrón específico.
@@ -170,6 +176,7 @@ log.info(f"Download folder: {download_path}")
 
 def open_main_excel(ksi_file):
     try:
+        log.info(f"KSI full path:      {ksi_file}")
         wb = load_workbook(ksi_file)
         log.info("Main Excel file opened successfully")
         return wb, ksi_file
@@ -183,16 +190,18 @@ def managed_driver(download_path: Path):
     opts.add_argument("--start-maximized")
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-infobars")
-    opts.add_argument("--headless=new")
-    opts.add_argument("--disable-gpu")
+    #opts.add_argument("--headless=new")
+    #opts.add_argument("--disable-gpu")
     opts.add_experimental_option("prefs", {
         "download.default_directory": str(download_path),
         "download.prompt_for_download": False,
         "directory_upgrade": True,
     })
+    driver_path = get_cached_driver_path()
+
     driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=opts
+       service=Service(driver_path),
+       options=opts
     )
     try:
         yield driver
@@ -205,8 +214,6 @@ def validate_env(log):
         errors.append("GMES_USER / GMES_PASS no encontrados en .env")
     if not URL:
         errors.append("URL_GMES no encontrada en .env")
-    if not KSI_FILE or not Path(KSI_FILE).exists():
-        errors.append(f"KSI_MONITORING_FILE no válido: {KSI_FILE}")
     if errors:
         for e in errors:
             log.error(e)
@@ -398,46 +405,10 @@ def process_excel(wb,download_path, log, nombre_archivo, sheet_name, start_row, 
         for c_idx, value in enumerate(row, start=start_col):
             ws_dst.cell(row=r_idx, column=c_idx, value=value)
 
-    wb_src.close()         # cerrar origen antes de guardar destino
+    wb_src.close()
+    wb.calculation.calcMode = "auto"
+    #wb.calculation.fullCalcOnLoad = True
     log.info("✅ Datos copiados y guardados")
-
-def processPV3():
-    file = MCM_QC_WORKING_FILE
-    if not file:
-        log.error("MCM QC working file not initialized")
-        return
-
-    excel = None
-    wb = None
-    try:
-        excel = win32com.client.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        excel.ScreenUpdating = False
-        excel.userControl = False
-        excel.WindowState = -4137  # xlMaximized
-        wb = excel.Workbooks.Open(file)
-        ws = wb.Sheets("PV3 (QC)")
-
-        ws.Activate()
-        pivot = ws.PivotTables(1)
-
-        pivot.ChangePivotCache(
-            wb.PivotCaches().Create(
-                SourceType=1,
-                SourceData="'Inv.All_Loc'!$B$2:$AG$18793"
-            )
-        )
-        pivot.RefreshTable()
-        excel.Calculation = -4105        # xlCalculationAutomatic: restaurar
-        excel.ScreenUpdating = True
-        wb.Save()
-        log.info("Workbook saved after PV3 processing")
-    finally:
-        if wb is not None:
-            wb.Close(SaveChanges=True)
-        if excel is not None:
-            excel.Quit()
 
 def run_login_case(driver, wait, log):
     log.info("login...")
@@ -458,7 +429,7 @@ def run_itrmqty_case(driver, wait, wb, download_path, log):
         el = wait.until(EC.element_to_be_clickable((By.ID, elem_id)))
         driver.execute_script("arguments[0].scrollIntoView(true);", el)
         el.click()
-
+    time.sleep(2)
     log.info("Switch iframe...")
     driver.switch_to.default_content()
     driver.switch_to.frame("mainTabControl_contents_1406_body")
@@ -490,7 +461,7 @@ def run_itrmqty_case(driver, wait, wb, download_path, log):
     log.info("Excel download process completed")
     time.sleep(1)
     log.info("Processing Excel file and copying to KSI...")
-    process_excel(wb, download_path, log, "Item Qty", "SAP&SCL ", 2, 1, 2)
+    process_excel(wb, download_path, log, "Item Qty", "SAP&SCL", 2, 1, 2)
     log.info("Item Qty processing completed")
     return wait_frame
 
@@ -513,7 +484,7 @@ def run_itembar_case(driver, wait_frame, wb, download_path, log):
     itembar_inquiry_wait_timeout = 900
     itembar_download_wait_timeout = 300
     #itembar_post_wait_seconds = 20
-    itembar_post_wait_seconds = 20
+    itembar_post_wait_seconds = 15
 
     for attempt in range(1, max_itembar_attempts + 1):
         try:
@@ -556,10 +527,12 @@ def run_itembar_case(driver, wait_frame, wb, download_path, log):
     process_excel(wb, download_path, log, "Bar ID Item  Qty", "Barcode", 2, 5, 2)
     log.info("Item Bar Qty processing completed")
 
-
 def run_mcm_monitoring_case(driver, wait_frame, download_path, log):
     log.info("Starting MCM Monitoring process...")
-    location = wait_frame.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a[aria-controls='tabControl1_contents_content3']")))
+
+    location = wait_frame.until(EC.element_to_be_clickable(
+        (By.CSS_SELECTOR, "a[aria-controls='tabControl1_contents_content3']")
+    ))
     driver.execute_script("arguments[0].scrollIntoView(true);", location)
     location.click()
     log.info("Location Item Qty selected")
@@ -569,28 +542,82 @@ def run_mcm_monitoring_case(driver, wait_frame, download_path, log):
     ckPrice.click()
     log.info("Price option selected")
 
-    log.info("Excecuting main search...")
     inquiry(driver)
-    log.info("Búsqueda iniciada")
     download_excel(driver, btn_id="btnGrid3ExcelDownload", file_name="Location Item Qty")
     log.info("Excel download process completed")
-    log.info("Processing MCM QC INV Monitoring Excel file and copying to KSI...")
-    mcm_qc = MCM_QC_WORKING_FILE
-    if not mcm_qc:
-         raise ValueError("MCM QC working file no inicializado")
 
-    wb2 = load_workbook(mcm_qc)
+    # ── STEP 1: Copy data with openpyxl ────────────────────────────────────
+    mcm_qc = get_mcm_qc_file(KPI_TEMPLATE_DIR)
+    if not mcm_qc:
+        raise ValueError("MCM QC working file no inicializado")
+    
+    today_str = datetime.now().strftime("%Y%m%d")
+
+    # ===== LOCAL TEMP FILES =====
+    local_dir = LOCAL_TEMP_DIR
+    local_dir.mkdir(exist_ok=True)
+    
+    # salida local
+    local_output = local_dir / f"MCM QC Inv Monitoring_{today_str}.xlsx"
+    new_mcm_path = Path(mcm_qc).parent / f"MCM QC Inv Monitoring_{today_str}.xlsx"
+    time.sleep(1)
+    shutil.copy2(mcm_qc, local_output)
+    log.info(f"MCM output file: {new_mcm_path.name}")
+    log.info("Copying Location Item Qty data into LOCAL MCM workbook...")
+
+    wb2 = load_workbook(local_output)
     try:
+        log.info("Procesing MCM ")
         process_excel(wb2, download_path, log, "Location Item Qty", "Inv.All_Loc", 3, 2, 2)
-        wb2.save(mcm_qc)
+        wb2.save(new_mcm_path)
     finally:
         wb2.close()
-    time.sleep(1)
-    processPV3()
+        #shutil.copy2(local_output, new_mcm_path)
+
+    # ── STEP 2: Refresh Pivot Table
+    time.sleep(2)
+    log.info("Apply Filters and Refresh PV3 pivot table...")
+    excel = None
+    wb_com = None
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible        = False
+        excel.DisplayAlerts  = False
+        excel.ScreenUpdating = False
+
+        wb_com = excel.Workbooks.Open(str(new_mcm_path.resolve()))
+        ws_inv = wb_com.Sheets("Inv.All_Loc") 
+        ws_pivot = wb_com.Sheets("PV3 (QC)")
+        pivot = ws_pivot.PivotTables(1)
+        pivot.ChangePivotCache(
+            wb_com.PivotCaches().Create(
+                SourceType=1,
+                SourceData="'Inv.All_Loc'!$B$2:$AG$18793"
+            )
+        )
+        pivot.RefreshTable()
+
+        excel.Calculation  = -4105   # xlCalculationAutomatic
+        excel.ScreenUpdating = True
+        wb_com.Save()
+        log.info("PV3 pivot refreshed and workbook saved")
+
+    finally:
+        if wb_com is not None:
+            try:
+                wb_com.Close(SaveChanges=True)
+            except Exception:
+                pass
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+
     log.info("MCM Monitoring processing completed")
 
 
-def run_wip_rm_defect_case(driver, wait, wb, download_path, log):
+def run_wip_rm_defect_case(driver, wait, wb, download_path, log, start, end):
     
     log.info("Starting WIP defect & RM defect process...")
     btn_nav, nav_context = find_element_in_default_or_iframes(driver, By.ID, "btn_nav04", timeout=25)
@@ -625,7 +652,7 @@ def run_wip_rm_defect_case(driver, wait, wb, download_path, log):
     driver.switch_to.default_content()
     wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "mainTabControl_contents_56_body")))
     wait_frame = WebDriverWait(driver, 10)
-    
+    time.sleep(1)
     start_date = wait.until(EC.presence_of_element_located((By.ID, "txtSearchPeriodBeginDate_input")))
     start_date.clear()
     start_date.send_keys(start)
@@ -654,7 +681,7 @@ def run_wip_rm_defect_case(driver, wait, wb, download_path, log):
     log.info("WIP defect & RM defect processing completed")
 
 
-def run_def_remain_case(driver, wait, wb, download_path, log):
+def run_def_remain_case(driver, wait, wb, download_path, log, start, end):
     log.info("Starting Def Remain Process...")
     driver.switch_to.default_content()
     menu_candidates = [
@@ -684,7 +711,7 @@ def run_def_remain_case(driver, wait, wb, download_path, log):
     log.info("Switch iframe...")
     driver.switch_to.frame("mainTabControl_contents_3129_body")
     wait_frame = WebDriverWait(driver, 10)
-    
+    time.sleep(1)
     start_date = wait.until(EC.presence_of_element_located((By.ID, "txtSearchPeriodBeginDate_input")))
     start_date.clear()
     start_date.send_keys(start)
@@ -720,14 +747,14 @@ def run_def_remain_case(driver, wait, wb, download_path, log):
         "Failure Confirm action Mgmt.",
         "Def. Remain",
         3,
-        5,
+        3,
         3,
         cols_to_delete=[2, 3, 12, 13],
     )
     log.info("Defect Remain processing completed")
 
 
-def run_selenium(wb,download_path, log):
+def run_selenium(wb,download_path, log, start, end):
     with managed_driver(download_path) as driver:
         wait = WebDriverWait(driver, 10)
         log.info(f"Navegando a: {URL}")
@@ -746,26 +773,28 @@ def run_selenium(wb,download_path, log):
         wait_frame = run_itrmqty_case(driver, wait, wb, download_path, log)
         run_itembar_case(driver, wait_frame, wb, download_path, log)
         run_mcm_monitoring_case(driver, wait_frame, download_path, log)
-        run_wip_rm_defect_case(driver, wait, wb, download_path, log)
-        run_def_remain_case(driver, wait, wb, download_path, log)
+        run_wip_rm_defect_case(driver, wait, wb, download_path, log, start, end)
+        run_def_remain_case(driver, wait, wb, download_path, log, start, end)
         log.info("All processes completed successfully")
                
 def main():
     validate_env(log)
-    global KSI_WORKING_FILE, MCM_QC_WORKING_FILE
+    start, end = get_date_range() 
+    temp_file = KPI_TEMPLATE_DIR
+    ksi_working_file = get_latest_file(temp_file, "Daily System Closing status_*.xlsx")
     wb = None
     ksi_file = None
 
     try:
         log.info("Starting GMES automation...")
-        KSI_WORKING_FILE, MCM_QC_WORKING_FILE = create_daily_monitoring_copies()
         log.info("Opening main Excel file...")
-        wb, ksi_file = open_main_excel(KSI_WORKING_FILE)
-        run_selenium(wb, download_path, log)
-
+        wb, ksi_file = open_main_excel(ksi_working_file)
+        run_selenium(wb, download_path, log, start, end)
+        today_str = datetime.now().strftime("%Y%m%d")
+        new_name = Path(ksi_file).parent / f"Daily System Closing status_{today_str}.xlsx"
+        log.info(f"Saving KSI file as: {new_name.name}")
         log.info("Saving changes to KSI Excel file...")
-        wb.save(ksi_file)  # Guardar cambios en el archivo principal de KSI
-        delete_all_excels(get_download_path())  # Limpiar archivos Excel descargados
+        wb.save(new_name)  
     except TimeoutException as e:
         log.error(f"Timeout esperando elemento: {e}")
         sys.exit(2)
@@ -779,6 +808,8 @@ def main():
         log.critical(f"An error occurred: {e}")
         sys.exit(1)
     finally:
+        delete_all_excels(get_download_path())
+        delete_all_excels(LOCAL_TEMP_DIR) 
         if wb is not None:
             wb.close()  # Cerrar el archivo de Excel
 
@@ -786,4 +817,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-   
